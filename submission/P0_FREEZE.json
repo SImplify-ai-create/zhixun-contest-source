@@ -1,0 +1,68 @@
+{
+ "schema": "contest.v2.p0-freeze",
+ "version": "2.0.0-p0",
+ "stage": "P0-frozen",
+ "frozen_at": "2026-11-17T19:46:27.098632+08:00",
+ "protocol": "contest.harness.workspace.v2",
+ "task_priority": [
+  "context",
+  "row",
+  "artifact"
+ ],
+ "acceptance": {
+  "suite": "tests/test_p0.py",
+  "cases": 25,
+  "result": "25 passed"
+ },
+ "upstream_verify": {
+  "tool": "tests/verify_upstream.py",
+  "ok": 29,
+  "errors": 0,
+  "warns": 0
+ },
+ "note": "P1 在同一棵树上继续演进，本清单是 P0 时点快照，不用于后续一致性校验；后续一致性以各阶段 manifest 为准。",
+ "files": [
+  {
+   "path": "app/harness.py",
+   "sha256": "c4ff2afb79ad489eb8afc3427e631b9fedd95b3e855066a715ed8261a6298ac1",
+   "bytes": 11676,
+   "lines": 293
+  },
+  {
+   "path": "app/contest_submission.py",
+   "sha256": "6c2eea43371be87ca89da280281bd9cbafcdb89c01bb663f94918e8f89eab61d",
+   "bytes": 16452,
+   "lines": 373
+  },
+  {
+   "path": "tests/fake_host.py",
+   "sha256": "a2a3977d7f250c82f9d10f263dc9a3fb1670ece216c91add69067ae6061ba7c3",
+   "bytes": 3070,
+   "lines": 93
+  },
+  {
+   "path": "tests/test_p0.py",
+   "sha256": "9aa081ebe15622bb1c2b17bec978f12506bb4e37e9f195cc0348c0fb58283b92",
+   "bytes": 14985,
+   "lines": 347
+  },
+  {
+   "path": "tests/verify_upstream.py",
+   "sha256": "923ed08fda269b7c79da551ff930b4416d71c067d9467bcdfdb7f559007028da",
+   "bytes": 2739,
+   "lines": 76
+  },
+  {
+   "path": "P0设计说明.md",
+   "sha256": "6b7189a77a6ff9c9a8d9c5701f59a98c47823d0c410b7fbf35eff7b31b1752ee",
+   "bytes": 8702,
+   "lines": 126
+  },
+  {
+   "path": "赛方问询清单.md",
+   "sha256": "151160177546187894a1ae64157b1352ec33fde902a0d98f48493cea87ab2884",
+   "bytes": 2257,
+   "lines": 23
+  }
+ ]
+}

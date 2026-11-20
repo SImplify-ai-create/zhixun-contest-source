@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>智训引擎 · 实验配置控制台</title>
+<style>
+  :root{--bg:#0b1220;--card:#121a2b;--line:#233047;--txt:#dbe4f3;--dim:#8fa0bd;
+        --cyan:#4fd1e0;--amber:#f6b352;--rose:#f07178;--green:#7bd88f;--violet:#a78bfa}
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{background:var(--bg);color:var(--txt);font:13.5px/1.6 "Microsoft YaHei",system-ui,sans-serif;padding:22px 3vw 50px}
+  h1{font-size:21px}h1 span{color:var(--cyan)}
+  .sub{color:var(--dim);font-size:12px;margin:4px 0 18px}
+  .wrap{display:grid;grid-template-columns:300px 1fr;gap:16px;align-items:start}
+  @media(max-width:900px){.wrap{grid-template-columns:1fr}}
+  .panel{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px 18px}
+  .panel h2{font-size:14.5px;margin-bottom:10px}
+  label{display:block;color:var(--dim);font-size:12px;margin:10px 0 3px}
+  select,input{width:100%;background:#0e1626;border:1px solid var(--line);border-radius:8px;
+    color:var(--txt);padding:7px 10px;font-size:13px;outline:none}
+  select:focus,input:focus{border-color:var(--cyan)}
+  .row2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .btn{width:100%;margin-top:14px;padding:9px;border-radius:9px;border:none;cursor:pointer;
+    font-size:14px;font-weight:700;color:#08111e;background:var(--cyan)}
+  .btn.stop{background:var(--rose);color:#1d0a0c;margin-top:8px}
+  .btn[disabled]{opacity:.45;cursor:not-allowed}
+  #log{height:230px;overflow:auto;background:#0a0f1c;border:1px solid var(--line);border-radius:10px;
+    padding:10px 12px;font:11.5px/1.55 Consolas,monospace;color:#9db3d6;white-space:pre-wrap}
+  .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin:14px 0}
+  .kpi{background:#0e1626;border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+  .kpi b{display:block;font-size:21px;color:var(--cyan)}
+  .kpi i{font-style:normal;color:var(--dim);font-size:11.5px}
+  .runs{max-height:180px;overflow:auto;font-size:12.5px}
+  .runs div{padding:5px 8px;border-radius:7px;cursor:pointer;color:var(--dim)}
+  .runs div:hover{background:#0e1626;color:var(--txt)}
+  .runs div.cur{background:#12233a;color:var(--cyan)}
+  .st{display:inline-block;font-size:11px;padding:1px 10px;border-radius:8px;margin-left:8px;vertical-align:2px}
+  .st.run{background:#12351f;color:var(--green)} .st.done{background:#12233a;color:var(--cyan)}
+  .st.err{background:#3a1518;color:var(--rose)}
+  .empty{color:var(--dim);font-size:12.5px;padding:8px 2px}
+  svg{width:100%;height:auto;display:block}
+  .legend{display:flex;gap:16px;flex-wrap:wrap;color:var(--dim);font-size:11.5px;margin-top:6px}
+  .legend s{text-decoration:none;display:inline-block;width:14px;height:4px;border-radius:2px;margin-right:5px;vertical-align:3px}
+  .legend u{text-decoration:none;display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px}
+</style>
+</head>
+<body>
+<h1>智训引擎 · <span>实验配置控制台</span></h1>
+<div class="sub">配置参数 → 启动自进化闭环 → 实时日志 → 曲线复盘。服务只监听本机，数据写入 runs/。</div>
+
+<div class="wrap">
+  <div>
+    <div class="panel">
+      <h2>实验配置</h2>
+      <label>预测模型</label>
+      <select id="model">
+        <option value="mlp">MLP 反应式（默认）</option>
+        <option value="kalman">卡尔曼 A · 线性 CV-KF</option>
+        <option value="hybrid">混合 B · MLP+残差卡尔曼</option>
+      </select>
+      <label>数据源</label>
+      <select id="source">
+        <option value="synthetic">合成数据流</option>
+        <option value="official">官方数据包（data/official）</option>
+      </select>
+      <div id="synBox">
+        <label>漂移类型</label>
+        <select id="drift">
+          <option value="sudden">突变漂移 sudden</option>
+          <option value="gradual">渐变漂移 gradual</option>
+        </select>
+      </div>
+      <div id="offBox" style="display:none">
+        <label>数据目录</label><input id="dataDir" value="data/official">
+        <label>划分（split）</label>
+        <select id="split"><option>val</option><option>train</option></select>
+      </div>
+      <div class="row2">
+        <div><label>批大小</label><input id="batchSize" type="number" value="200" min="50" step="50"></div>
+        <div><label>标注预算</label><input id="labelBudget" type="number" value="4000" min="500" step="500"></div>
+      </div>
+      <div class="row2">
+        <div><label>重训槽位</label><input id="maxRetrains" type="number" value="10" min="1" max="50"></div>
+        <div><label>残差因子</label><input id="residualFactor" type="number" value="3.0" min="1.5" max="6" step="0.5"></div>
+      </div>
+      <label>实验名称（可选）</label>
+      <input id="expName" placeholder="console-demo">
+      <button class="btn" id="btnRun">启动实验</button>
+      <button class="btn stop" id="btnStop" disabled>停止</button>
+    </div>
+
+    <div class="panel" style="margin-top:16px">
+      <h2>历史实验 <span style="color:var(--dim);font-size:11px">点击加载曲线</span></h2>
+      <div class="runs" id="runs"><div class="empty">加载中…</div></div>
+    </div>
+  </div>
+
+  <div>
+    <div class="panel">
+      <h2>运行日志 <span class="st" id="st" style="display:none"></span></h2>
+      <div id="log">等待启动…</div>
+    </div>
+
+    <div class="panel" style="margin-top:16px">
+      <h2>结果复盘 <span id="curFile" style="color:var(--dim);font-size:11.5px"></span></h2>
+      <div id="resBody"><div class="empty">还没有结果——启动一次实验，或在右侧历史列表点击任意一条。</div></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+const TIER_C={observe:"#4fd1e0",incremental:"#f6b352",full:"#f07178",none:"#2a3650"};
+let pollTimer=null, lastLogLen=0;
+
+$("source").onchange=()=>{const off=$("source").value==="official";
+  $("offBox").style.display=off?"":"none";$("synBox").style.display=off?"none":"";};
+
+function setStatus(running,rc){
+  const st=$("st");st.style.display="inline-block";
+  if(running){st.className="st run";st.textContent="运行中";}
+  else if(rc===0){st.className="st done";st.textContent="完成";}
+  else if(rc!=null){st.className="st err";st.textContent="退出码 "+rc;}
+  else {st.style.display="none";}
+  $("btnRun").disabled=running;$("btnStop").disabled=!running;
+}
+
+async function poll(){
+  const s=await (await fetch("/api/status")).json();
+  setStatus(s.running,s.rc);
+  if(s.log.length>lastLogLen||!s.running){
+    $("log").textContent=s.log.join("\n");$("log").scrollTop=1e9;lastLogLen=s.log.length;}
+  if(!s.running){
+    clearInterval(pollTimer);pollTimer=null;
+    if(s.csv) loadResult(s.csv);
+    refreshRuns();
+  }
+}
+
+$("btnRun").onclick=async()=>{
+  lastLogLen=0;$("log").textContent="";$("curFile").textContent="";
+  const body={source:$("source").value,drift:$("drift").value,
+    model:$("model").value,
+    data_dir:$("dataDir").value,split:$("split").value,
+    batch_size:+$("batchSize").value,label_budget:+$("labelBudget").value,
+    max_retrains:+$("maxRetrains").value,residual_factor:+$("residualFactor").value,
+    experiment_name:$("expName").value||"console"};
+  const r=await (await fetch("/api/run",{method:"POST",
+    headers:{"Content-Type":"application/json"},body:JSON.stringify(body)})).json();
+  $("log").textContent=r.msg;
+  if(r.ok){pollTimer=setInterval(poll,800);setTimeout(poll,300);}
+};
+
+$("btnStop").onclick=async()=>{await fetch("/api/stop",{method:"POST"});};
+
+/* ---- 结果图表（SVG 手绘，与仪表盘同风格） ---- */
+const NS="http://www.w3.org/2000/svg";
+function frame(w,h,ml,mr,mt,mb){const svg=document.createElementNS(NS,"svg");
+  svg.setAttribute("viewBox",`0 0 ${w} ${h}`);
+  svg.innerHTML=`<rect x="${ml}" y="${mt}" width="${w-ml-mr}" height="${h-mt-mb}" fill="#0e1626" stroke="#233047" rx="6"/>`;
+  return {svg,X:v=>ml+(w-ml-mr)*v,Y:(v0,v1)=>v=>mt+(h-mt-mb)*(1-(v-v0)/((v1-v0)||1))};}
+function fmt(v){return Math.abs(v)>=100?Math.round(v):Math.abs(v)>=1?+v.toFixed(1):+v.toFixed(2);}
+
+function drawResult(d){
+  $("curFile").textContent=d.file;
+  const k=d.kpi;
+  const kpis=[["末段 RMSE",k.tail],["峰值 RMSE",k.peak],["标注消耗",k.labels+" 条"],["重训次数",k.retrains]];
+  const rmseSvg=rmseChart(d);
+  const tierSvg=tierLine(d.tiers);
+  $("resBody").innerHTML=`<div class="kpis">${kpis.map(([i,v])=>`<div class="kpi"><b>${v}</b><i>${i}</i></div>`).join("")}</div>`;
+  $("resBody").appendChild(rmseSvg);
+  const lg=document.createElement("div");lg.className="legend";
+  lg.innerHTML=`<s style="background:#4fd1e0"></s>评估 RMSE<u style="background:#f6b352"></u>重训练动作<u style="background:#f07148"></u>真实漂移点`;
+  $("resBody").appendChild(lg);
+  const h3=document.createElement("div");h3.style.cssText="color:#8fa0bd;font-size:12px;margin:12px 0 4px";
+  h3.textContent="严重度分档时间线";$("resBody").appendChild(h3);
+  $("resBody").appendChild(tierSvg);
+  const lg2=document.createElement("div");lg2.className="legend";
+  lg2.innerHTML=Object.keys(TIER_C).map(k2=>`<s style="background:${TIER_C[k2]}"></s>${k2}`).join("");
+  $("resBody").appendChild(lg2);
+}
+
+function rmseChart(d){
+  const w=880,h=270,ml=52,mr=14,mt=12,mb=28;
+  const f=frame(w,h,ml,mr,mt,mb);
+  const v1=Math.max(...d.rmse)*1.05,v0=0,Y=f.Y(v0,v1);
+  const bmax=Math.max(...d.batches,1),Xb=b=>f.X(b/bmax);
+  let s="";
+  [0,v1/2,v1].forEach(v=>{s+=`<line x1="${f.X(0)}" x2="${f.X(1)}" y1="${Y(v)}" y2="${Y(v)}" stroke="#233047" stroke-dasharray="2 4" opacity=".5"/><text x="${f.X(0)-8}" y="${Y(v)+4}" fill="#8fa0bd" font-size="10" text-anchor="end">${fmt(v)}</text>`;});
+  [0,.25,.5,.75,1].forEach(t=>{const b=bmax*t;s+=`<text x="${Xb(b)}" y="${h-mb+15}" fill="#8fa0bd" font-size="10" text-anchor="middle">${Math.round(b/100)*100/1000}k</text>`;});
+  d.drift_points.forEach(b=>{s+=`<line x1="${Xb(b)}" x2="${Xb(b)}" y1="${mt}" y2="${h-mb}" stroke="#f07178" opacity=".55" stroke-dasharray="4 3"/>`;});
+  d.retrains.forEach(b=>{const i=Math.round(b/bmax*(d.rmse.length-1));const v=d.rmse[i];if(v!=null)
+    s+=`<circle cx="${Xb(b)}" cy="${Y(v)}" r="4" fill="#f6b352"/>`;});
+  s+=`<path d="${d.rmse.map((v,i)=>`${i?"L":"M"}${f.X(i/Math.max(d.rmse.length-1,1)).toFixed(1)},${Y(v).toFixed(1)}`).join("")}" fill="none" stroke="#4fd1e0" stroke-width="2"/>`;
+  f.svg.innerHTML+=s;return f.svg;
+}
+
+function tierLine(tiers){
+  const n=tiers.length;
+  const cells=tiers.map((t,i)=>`<rect x="${i/n*100}" y="0" width="${100/n+0.15}" height="100%" fill="${TIER_C[t]||"#2a3650"}" opacity=".85"/>`).join("");
+  const svg=document.createElementNS(NS,"svg");
+  svg.setAttribute("viewBox","0 0 100 10");svg.setAttribute("preserveAspectRatio","none");
+  svg.style.cssText="height:38px;border-radius:8px;overflow:hidden";
+  svg.innerHTML=`<g>${cells}</g>`;return svg;
+}
+
+async function loadResult(f){
+  const d=await (await fetch("/api/result?f="+encodeURIComponent(f))).json();
+  if(d.error){$("resBody").innerHTML=`<div class="empty">${d.error}</div>`;return;}
+  drawResult(d);
+}
+
+async function refreshRuns(){
+  const r=await (await fetch("/api/runs")).json();
+  $("runs").innerHTML=r.runs.length?r.runs.map(x=>`<div data-f="${x.file}">${x.mtime} ｜ ${x.file}</div>`).join("")
+    :'<div class="empty">runs/ 下还没有实验</div>';
+  [...$("runs").children].forEach(el=>el.onclick=()=>{
+    [...$("runs").children].forEach(e=>e.classList.remove("cur"));
+    el.classList.add("cur");loadResult(el.dataset.f);});
+}
+
+refreshRuns();
+fetch("/api/status").then(r=>r.json()).then(s=>{
+  setStatus(s.running,s.rc);
+  if(s.running){$("log").textContent=s.log.join("\n");lastLogLen=s.log.length;
+    pollTimer=setInterval(poll,800);}
+  else if(s.csv){loadResult(s.csv);lastLogLen=s.log.length;}
+});
+</script>
+</body>
+</html>

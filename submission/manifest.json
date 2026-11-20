@@ -1,0 +1,650 @@
+{
+ "schema": "contest.v2.manifest",
+ "version": "2.3.0-p2-hardening",
+ "stage": "P2+hardening",
+ "built_at": "2026-11-18T18:32:19.104152+08:00",
+ "p0_freeze": {
+  "path": "P0_FREEZE.json",
+  "sha256": "91c918948066010d834cdfc925ff127dab03b7bc45f16b0a4e7c48cf4376ae12",
+  "note": "P0 时点快照；P1 起同树演进，一致性以各阶段记录为准"
+ },
+ "protocol": {
+  "name": "contest.harness.workspace.v2",
+  "sdk": {
+   "package": "contest_harness",
+   "version": "1.0.2"
+  },
+  "prompt_version": "industrial-workspace-flexible-v3",
+  "model_access": "host_gateway_rpc"
+ },
+ "entry": {
+  "harness": "app/harness.py",
+  "module": "app/contest_submission.py",
+  "submission_env": "CONTEST_SUBMISSION",
+  "module_path_in_image": "/app/contest_submission.py",
+  "harness_path_in_image": "/app/harness.py",
+  "commands": [
+   "describe",
+   "train",
+   "predict"
+  ],
+  "exit_codes": {
+   "0": "正常",
+   "1": "契约/内部错误（train 先 emit round_failed；已 flush 的合法行不回滚）",
+   "2": "未知命令",
+   "3": "本地 harness 无 SDK start 帧；真机由宿主调用 train(rnd)，一轮实现在 train_round.run"
+  }
+ },
+ "tasks": [
+  "classification",
+  "regression"
+ ],
+ "environment_contract": {
+  "predict": {
+   "model_dir": "/model（根目录，不是检查点文件）",
+   "checkpoint": "CONTEST_ARTIFACT_PATH",
+   "context": [
+    "CONTEST_PREDICTION_CONTEXT",
+    "CONTEST_DATASET_KEY",
+    "CONTEST_TASK"
+   ],
+   "stdout": "只写协议 JSONL，逐行写后立即 flush",
+   "stderr": "全部日志"
+  },
+  "describe": {
+   "stdout": "一行 JSON",
+   "side_effects": "无：不读 /data、不联网、不扫 /app 找权重"
+  },
+  "train": {
+   "entry": "app/contest_submission.py::train(rnd) → app/train_round.py::run(rnd)",
+   "local_harness": "本地 harness 构造不出 rnd（无 SDK start 帧），仍 exit 3；真机由 SDK 宿主调用",
+   "acceptance": "tests/test_p2.py 用 rnd 替身驱动整轮"
+  }
+ },
+ "checkpoint_contract": {
+  "format": "numpy .npz，allow_pickle=False",
+  "required": [
+   "task",
+   "coef"
+  ],
+  "classification_required": [
+   "classes"
+  ],
+  "optional": [
+   "intercept",
+   "feature_order",
+   "prior_majority_class",
+   "prior_mean",
+   "action",
+   "action_params"
+  ],
+  "prior_fallback": {
+   "classification": "prior_majority_class；未注册时退 classes[0] 并在 stderr 标注",
+   "regression": "prior_mean；未注册时退 0.0 并在 stderr 标注"
+  },
+  "action_policy": "action 缺省 identity；predict 侧只接受 causal，transductive 在装载期 fail-fast（exit 1）"
+ },
+ "classes_contract": {
+  "scope": "官方 MLP 检查点（无 task/coef）；v2 自有格式的 classes 由产物自身携带，不走本规则",
+  "rule": "优先 metadata.classes，长度必须等于 w2.shape[1]，即 w2 的列序；缺失时读 /data/train.jsonl 的 answer 标签集合，按字典序 sorted() 定死（不是首次出现序），标签数必须等于 w2.shape[1]；触发兜底时 stderr 标注可能错位",
+  "rule_short": "metadata.classes 优先；缺失时 train.jsonl 标签字典序",
+  "source": "metadata.classes",
+  "labels": [
+   "Ethanol",
+   "Ethylene",
+   "Ammonia",
+   "Acetaldehyde",
+   "Acetone",
+   "Toluene"
+  ],
+  "label_count": 6,
+  "w2_shape": [
+   32,
+   6
+  ],
+  "checkpoint_sha256": "fd1e08b2aad08b2e9754f9b2dfdc029481c0da7ecdedca0abb0ec6fcc818c757",
+  "resolved_from": "训练起点/cpu-a-guide-20261110-v1/checkpoint.npz 的 metadata.classes（与 a-parent 候选同一份文件）",
+  "code": [
+   "app/contest_submission.py::_load_official（分类取 metadata.classes、长度校验）",
+   "app/contest_submission.py::_fallback_classes（字典序兜底 + stderr 标注）",
+   "app/llm_cage.py::_check_official_checkpoint（classes 与 w2 列数一致、无重复）"
+  ],
+  "single_source": "_Head.classes：predict 输出顺序与 check_candidate 的 classes_source 同源",
+  "describe_surface": "describe() 从 manifest.json 本字段读取，不另存第二份",
+  "verified_by": [
+   "tests/test_p0.py::OfficialCheckpointTest.test_classes_order_comes_from_metadata",
+   "tests/test_p0.py::OfficialCheckpointTest.test_missing_metadata_classes_uses_sorted_train_labels",
+   "tests/test_p0.py::P0Test.test_describe_shape"
+  ]
+ },
+ "predict_policy": {
+  "mode": "总输出 + 声明默认",
+  "guarantee": "每个非空输入行对应一行输出；结束时的行数核对是事后自检（触发时整批已作废），不是保护措施",
+  "row_level": "解析失败、缺特征、非数值、维度不符、行/上下文 task 与产物冲突 → 预注册确定性兜底 + stderr 记录，退出码 0",
+  "batch_level": "产物不可读（检查点缺失/形状不符/动作非法）→ 退出码 1、一行不写",
+  "fallback_state": "兜底分支不更新任何流式状态：坏行不得影响后续行的归一化",
+  "rationale": "平台缺一行即整批作废，报错停等于废掉整批；兜底值来自产物预注册先验，不依赖输入，可离线复核",
+  "determinism": "同一批样本连续 predict 两遍，stdout 逐字节（sha256）一致；分类、回归、声明默认兜底行、流式动作均在 tests/test_hardening.py 常规断言"
+ },
+ "load_time_precompute": {
+  "where": "app/contest_submission.py::_load_head",
+  "constants": [
+   "feature_order 钉成 tuple（未声明时只在首行排序一次并钉住）",
+   "动作门禁、参数校验与实现选择一次完成，捕获成 step 闭包",
+   "coef 转连续 float 数组，n_features 预存"
+  ],
+  "row_path": "取数 → step → 一次矩阵乘；不重复排序、不求均值、不再读文件",
+  "evidence": "tests/test_hardening.py::PrecomputeTest：40 行内 np.load 1 次、_STATS.sorts 0 次、np.mean/np.average 被禁止调用"
+ },
+ "task_priority": {
+  "order": [
+   "context",
+   "row",
+   "artifact"
+  ],
+  "cases": {
+   "context_present": "用上下文；行 task 由 SDK 与上下文绑死，两者恒等",
+   "context_missing_row_present": "用行 task",
+   "both_missing": "用产物 task，逐行在 stderr 标注",
+   "context_conflicts_artifact": "逐行兜底：该行按声明默认输出并在 stderr 标注行号，其余行继续，退出码 0"
+  },
+  "rationale": "上下文与行由平台生成，产物是我们自己挂的；最下游的不该当权威"
+ },
+ "task_declaration": {
+  "image_reports": [
+   "classification",
+   "regression"
+  ],
+  "candidate_reports": "候选在 SDK 里不申报 task；候选每轮每数据集一个，天然单任务",
+  "dispatch": "predict 按 CONTEST_TASK / CONTEST_PREDICTION_CONTEXT 泛型分派",
+  "output_shape_owner": "按 上下文 > 行 > 产物 解析出的 task；只有上下文与行都缺失时才由产物决定"
+ },
+ "design_note": "P0设计说明.md",
+ "p1": {
+  "goal": "批级检测下沉到 train；predict 只保留因果流式动作",
+  "stage_split": {
+   "train": [
+    "kl",
+    "mahalanobis",
+    "bbsd"
+   ],
+   "predict": [],
+   "rule": "predict 侧不导入 detectors / selector / train_stage"
+  },
+  "actions": {
+   "causal": [
+    "identity",
+    "streaming_ema_norm",
+    "per_cond_seq"
+   ],
+   "transductive": [
+    "per_cond_mono_norm",
+    "batch_zscore"
+   ],
+   "predict_policy": "transductive 在 predict 侧显式拒绝（exit 1，一行不写），不静默降级",
+   "state_policy": "状态只在产出通过出站断言之后提交；声明默认分支不提交"
+  },
+  "detectors": {
+   "data": [
+    "/data/train.jsonl",
+    "/data/validation.jsonl"
+   ],
+   "kl": {
+    "bins": 10,
+    "threshold": 0.15,
+    "note": "对称 KL 的逐特征均值；阈值高于小样本估计偏差（n=200 噪声地板约 0.06）"
+   },
+   "mahalanobis": {
+    "threshold": 6.0,
+    "note": "validation 到 train 高斯的平均平方马氏距离"
+   },
+   "bbsd": {
+    "threshold": 25.0,
+    "domain": "features",
+    "note": "v1 的 BBSD 建在 softmax 上且仅分类；train 阶段无可靠后验，退化为特征空间 Hotelling T²，报告里标 bbsd_domain"
+   }
+  },
+  "selector": {
+   "candidates": {
+    "A": "streaming_ema_norm",
+    "B": "per_cond_seq",
+    "C": "identity"
+   },
+   "rules": [
+    "R1 has_group and (kl>=0.15 or bbsd>=25) → B",
+    "R2 kl>=0.15 or mahalanobis>=6 or bbsd>=25 → A",
+    "R3 否则 → C"
+   ],
+   "trace_schema": "contest.v2.selector-trace",
+   "trace_file": "selector_trace.json",
+   "trace_dir": "out_dir > CONTEST_TRACE_DIR > /workspace > cwd；每次选择都落盘",
+   "trace_fields": [
+    "inputs",
+    "detectors",
+    "thresholds",
+    "rules",
+    "chosen",
+    "rejected"
+   ]
+  },
+  "entry": "app/train_stage.py::run(data_dir, out_dir, task)",
+  "acceptance": {
+   "suite": "tests/test_p1.py",
+   "cases": 15,
+   "result": "15 passed",
+   "covered": [
+    "动作库按 causal / transductive 分开",
+    "transductive 动作在 predict 侧 exit 2、一行不写",
+    "未知动作 exit 2",
+    "causal 动作逐行累积状态",
+    "兜底分支不推进流式状态",
+    "identity 保持 P0 行为",
+    "检测器拒绝非 train 阶段",
+    "selector 拒绝非 train 报告",
+    "predict 模块不加载 detectors / selector",
+    "train_stage 落盘 selector_trace 且与内存一致",
+    "selector_trace 可复现",
+    "明显漂移不选 identity、无漂移选 identity",
+    "缺数据文件报错",
+    "候选只挂 causal 动作"
+   ]
+  },
+  "totals": {
+   "cases": 40,
+   "result": "40 passed（P0 25 + P1 15）"
+  }
+ },
+ "p2": {
+  "goal": "接 SDK 训练循环：一轮 = 一次 train(rnd)，模型承担真实提案职责",
+  "entry": "app/train_round.py::run(rnd, data_dir=None, work_dir=None, pessimism_k=None)",
+  "flow": [
+   "rnd.parent.path(rel) 打开父检查点并自核 sha256（不扫 /app、不改 /previous）",
+   "读 /data/train.jsonl + /data/validation.jsonl（或 rnd.task.public_projection）跑 P1 检测选型",
+   "rnd.history() 作经验库读取入口，算 history_digest",
+   "rnd.model() 恰好一次（temperature=0，显式 max_tokens），读 history + 本轮数据给候选提案",
+   "造候选：PARENT 逐字节复制父检查点；A/B/C 保留全部数组、只改写 action / action_params",
+   "rnd.submit_candidate(...) 读回 artifact_id 与平台验证摘要",
+   "state_workspace 复制 /state 后写本轮状态（含回滚指针），rnd.save_state(...)",
+   "rnd.finish(selected_artifact_id=..., model_call_ids=rnd.call_ids, history_ids=...)"
+  ],
+  "hard_constraints": {
+   "max_tokens": "显式传：min(512, rnd.max_output_tokens)，不依赖默认值",
+   "prompt_injection": "不重复注入 rnd.prompt；system/user 消息全部由本模块构造",
+   "empty_receipt": "receipt.text 为空或解析不出候选 → 退回续训父检查点，stderr 记录",
+   "model_call_ids": "只来自 rnd.call_ids / receipt.call_id；为空则整轮失败，不 finish"
+  },
+  "ledger": {
+   "hypothesis": "沿用检测器指向的漂移假设（同 selector.hypothesis）；PARENT 时为沿用父检查点",
+   "change_summary": "相对父模型改了什么（权重未训练 / 只换特征动作）",
+   "configuration": "检测器数值、选型规则、模型调号与提案、history_digest、seed、候选摘要、预算",
+   "reason": "只引 submit 回执里的平台数字（validation.* / metrics.* 等），不含自算检测值",
+   "state": "schema=contest.v2.round-state；previous_selected_artifact_id 承接回滚"
+  },
+  "r1_policy": "round_index==1 固定提交 PARENT（续训父检查点）；模型提案仍调用并记入 configuration.model.proposal",
+  "reproducibility": "同一 history + 同一数据 + 同一 round_index → 同一提案与同一账本；temperature=0、无时间戳、候选目录名由内容摘要决定",
+  "state_policy": "/state 只读：先 state_workspace 复制再写；多次保存均以轮次开始时的状态为父",
+  "files": [
+   "app/train_round.py",
+   "app/contest_submission.py（train 委托）",
+   "app/harness.py（train 提示改口径）"
+  ],
+  "acceptance": {
+   "suite": "tests/test_p2.py",
+   "host_double": "FakeRnd / FakeParent（实现 parent.path / history / model / submit_candidate / state_workspace / save_state / finish）",
+   "cases": 17,
+   "result": "17 passed",
+   "covered": [
+    "R1 固定 PARENT，候选与父检查点逐字节一致",
+    "每轮恰好一次 rnd.model()，max_tokens 显式且受 rnd.max_output_tokens 约束",
+    "消息里不含 rnd.prompt 哨兵",
+    "receipt.text 空 / 不可解析 → 退回 PARENT + stderr",
+    "模型提案在 R1 记入账本但不采用",
+    "R2+ 采用模型提案，且可与检测器建议不同",
+    "账本五字段落盘，reason 只含平台数字",
+    "finish 的 model_call_ids 来自 rnd.call_ids，无真实调用号则整轮失败",
+    "history_ids 流入 finish，history 内容进入提案上下文",
+    "状态带 previous_selected_artifact_id 回滚指针",
+    "父检查点摘要不符整轮失败、不提交",
+    "父检查点只经 parent.path 读取",
+    "同一 history 两次运行 → 同一提案 / 账本 / 候选目录名",
+    "数据目录可从 public_projection 解析"
+   ]
+  },
+  "totals": {
+   "cases": 57,
+   "result": "57 passed（P0 25 + P1 15 + P2 17）"
+  }
+ },
+ "hardening": {
+  "goal": "把三项工程承诺变成可复现证据，只动 v2，不碰 v1",
+  "items": {
+   "H-D3_determinism": {
+    "what": "同一批样本连续 predict 两遍，stdout 逐字节（sha256）比对，差异即失败",
+    "tool": "tests/fake_host.py::run_bytes（保留原始 stdout 字节）",
+    "suite": "tests/test_hardening.py::DeterminismTest",
+    "covers": [
+     "分类批次",
+     "回归批次",
+     "声明默认兜底行（坏 JSON / 行 task 不符 / 缺特征 / 非数值）",
+     "带 streaming_ema_norm 的流式分类批次",
+     "同一进程内同批喂两遍（无状态动作）"
+    ],
+    "cases": 5
+   },
+   "load_time_precompute": {
+    "what": "feature_order 映射、动作参数、归一化常量在装载期算好；每行只做一次矩阵乘",
+    "change": [
+     "actions.prepare() 一次校验并返回 step 闭包；apply() 复用同一实现",
+     "_Head 增加 order(tuple) / order_source / n_features / act",
+     "_vector 行路径不再 sorted；未声明 feature_order 时仅首行排序一次并钉住",
+     "_STATS 计数 loads/rows/sorts，_debug_state() 可查"
+    ],
+    "assertions": [
+     "order 是 tuple 且 order_source=feature_order",
+     "coef 连续、动作参数已解析为 float",
+     "40 行内 np.load 恰好 1 次",
+     "_STATS.sorts == 0",
+     "np.mean / np.average 在行路径被禁止调用（补丁即报错）"
+    ],
+    "cases": 4
+   },
+   "H-D2_pessimism": {
+    "what": "候选臂后验悲观界 mean - k*sd 低于父候选一律不采纳；失败一轮即回退并冷却",
+    "config": {
+     "k": 1.0,
+     "override": "run(pessimism_k=...) > CONTEST_PESSIMISM_K > PESSIMISM[\"k\"]",
+     "k_rationale": "k=1 是“均值低一个后验标准差”的标准悲观估计（UCB 的对称面），与分数尺度无关；k=0 退化为只比均值",
+     "cooldown_rounds": 1
+    },
+    "state": "round_state.json::arms = {PARENT,A,B,C} × {n, mean, m2, failures, cooldown}；arm_score 记平台分数键与方向",
+    "rules": [
+     "未观测的臂不参与比较（不提前判死）",
+     "cooldown>0 的臂本轮不采纳",
+     "bound < parent_bound → 退回 PARENT，policy=pessimism_bound_below_parent",
+     "提交失败一轮 → failures+1、cooldown=1、均值向父候选收缩一半（双方均有观测时）、同轮改用 PARENT 重提，policy=pessimism_fallback_parent"
+    ],
+    "suite": "tests/test_hardening.py::PessimismTest",
+    "cases": 7
+   }
+  },
+  "totals": {
+   "cases": 75,
+   "result": "75 passed（P0 25 + P1 15 + P2 17 + 新增 18）"
+  },
+  "upstream_check": "tests/verify_upstream.py：29/29 通过，ERROR 0，WARN 0",
+  "deferred": {
+   "detector_between_rounds": {
+    "status": "只记不做",
+    "idea": "检测器改为轮次间直接对比：state 存上一轮 /data 指纹，两轮直接比较 + 置换检验",
+    "effect": "检测器从常设岗哨变成变更触发的诊断",
+    "wiring": "等验证标签杠杆的实测数字回来后一起接；本轮未改 detectors / train_stage"
+   }
+  }
+ },
+ "upstream": {
+  "base": ".",
+  "base_note": "清单内路径均相对 base；本仓库不含这些上游工件。",
+  "archive_manifest": "2026-11-17/contest-v2-freeze/outputs/archive_manifest.json",
+  "archive_manifest_sha256": "9a6f8db7c9fc952a714b544cbbd1d96f9b7ae828ad7e971c00d66a0493acda8d",
+  "verify_tool": "tests/verify_upstream.py",
+  "stability_rule": "frozen=v1 已物理只读，hash 不符即 ERROR；snapshot=该目录冻结时仍在写，hash 不符只 WARN",
+  "file_count": 28,
+  "files": [
+   {
+    "path": "2026-11-15/b-floor/floor_report.md",
+    "sha256": "db5c1cdeddf7d90ccc97e8ef8597d52f867c331f35002677d9a969a81af6e8ac",
+    "lines": 83,
+    "role": "B 流下限结论与限制说明",
+    "stability": "frozen"
+   },
+   {
+    "path": "2026-11-15/b-floor/floor_results.json",
+    "sha256": "d6247980bbbb31707041042a2deb62eefd99492cfddb78b047f9e372af6c1a8c",
+    "lines": 97,
+    "role": "B 流下限数值（v2 回归下限锚点）",
+    "stability": "frozen"
+   },
+   {
+    "path": "2026-11-15/official-alignment/C/report.md",
+    "sha256": "b58923e8d3cfd8cf44886a7e514f1cf19bd7abe617e21b65095b5cc7f1cf1eea",
+    "lines": 35,
+    "role": "C 流官方口径复现结论（v2 基线锚点）",
+    "stability": "frozen"
+   },
+   {
+    "path": "2026-11-15/official-alignment/align_lib.py",
+    "sha256": "14c6f4e04615659c33ea5798d4e6f08ad1fbf808ff74efa4b056c7c22bb00c4d",
+    "lines": 250,
+    "role": "指标与切分对齐工具（v2 评估口径复用）",
+    "stability": "frozen"
+   },
+   {
+    "path": "2026-11-15/official-alignment/rounds_lib.py",
+    "sha256": "9e1cc44b6b3eee80b1d4edd2b76eecdc2dc788ccbb94a733dd9201f576acceaf",
+    "lines": 320,
+    "role": "轮次循环与状态记账工具（v2 训练侧参考）",
+    "stability": "frozen"
+   },
+   {
+    "path": "2026-11-15/platform-s0/z0/baselines/data.py",
+    "sha256": "6099e312829ac3aaf48209ec1f618532c4a8552fedf73f09cf31c8876261db65",
+    "lines": 95,
+    "role": "官方基线数据装载（v2 输入解析参考）",
+    "stability": "snapshot"
+   },
+   {
+    "path": "2026-11-15/platform-s0/z0/baselines/model.py",
+    "sha256": "325026d80747eb36f39c8df1be02b640ae21b3cd082827c66aacbdf273dd61c5",
+    "lines": 200,
+    "role": "官方基线模型实现（v2 predict 数值骨架参考）",
+    "stability": "snapshot"
+   },
+   {
+    "path": "2026-11-15/platform-s0/z0/baselines/predict.py",
+    "sha256": "80e6787cd862dfefd85cd6bfcd73b5577dd90e202dd3d5bb9f18a52761807452",
+    "lines": 42,
+    "role": "官方基线预测入口（v2 predict 形状参考）",
+    "stability": "snapshot"
+   },
+   {
+    "path": "2026-11-15/signature-routing/outputs/policy_library.json",
+    "sha256": "2ff95630b7cec50dd4481d0470634d12a69b7cc01ddab43e8d30d9107c81626b",
+    "lines": 303,
+    "role": "策略库快照（P4 复用）",
+    "stability": "snapshot"
+   },
+   {
+    "path": "2026-11-15/signature-routing/outputs/routing_contract.py",
+    "sha256": "91957f805ba6f1778b14aecbefde288c566ce5d9435af1c956382f77de206450",
+    "lines": 1341,
+    "role": "路由契约与 TABLE 真源（P4 复用）",
+    "stability": "snapshot"
+   },
+   {
+    "path": "2026-11-16/detector-lib/detlib/__init__.py",
+    "sha256": "eceb72dde4432a4268a99c7e7945295ed643feab82f03e0ae7667e299941c9b5",
+    "lines": 39,
+    "role": "检测器库核心模块（P3 复用）",
+    "stability": "snapshot"
+   },
+   {
+    "path": "2026-11-16/detector-lib/detlib/activation.py",
+    "sha256": "4c436b5349c8493936c497df52d2e7f108b22cb3cd86afce85048ecb3b825c67",
+    "lines": 424,
+    "role": "检测器库核心模块（P3 复用）",
+    "stability": "snapshot"
+   },
+   {
+    "path": "2026-11-16/detector-lib/detlib/cluster.py",
+    "sha256": "3d37110f7c3a2ae5ae113537d9da010c4a229c0eca9d4156d3880b22eecda4c5",
+    "lines": 228,
+    "role": "检测器库核心模块（P3 复用）",
+    "stability": "snapshot"
+   },
+   {
+    "path": "2026-11-16/detector-lib/detlib/config.py",
+    "sha256": "fd7a5c20505f6d9f3917705dd3851b1648b142bc6a1308ad719f2f4e7d85115a",
+    "lines": 129,
+    "role": "检测器库核心模块（P3 复用）",
+    "stability": "snapshot"
+   },
+   {
+    "path": "2026-11-16/detector-lib/detlib/detectors.py",
+    "sha256": "6cc7b8238d377c09fd78075e07fdc62fb5db3d92e070cb77f5de617f7f4593e4",
+    "lines": 283,
+    "role": "检测器库核心模块（P3 复用）",
+    "stability": "snapshot"
+   },
+   {
+    "path": "2026-11-16/detector-lib/detlib/fusion.py",
+    "sha256": "e39126712a9f636c96e9616907cb98136373a35b46376acb7afacadeb39d919b",
+    "lines": 268,
+    "role": "检测器库核心模块（P3 复用）",
+    "stability": "snapshot"
+   },
+   {
+    "path": "2026-11-16/detector-lib/detlib/layers.py",
+    "sha256": "32cdbec8d8f75a9b5f260e24a6b7a25e8cbacd54abfb85a8c5338305f2139b00",
+    "lines": 139,
+    "role": "检测器库核心模块（P3 复用）",
+    "stability": "snapshot"
+   },
+   {
+    "path": "2026-11-16/detector-lib/detlib/persample.py",
+    "sha256": "9a4d8150b77ce77bf9e9040d4862007fc799e7d29fff6e9d860f1683d155d101",
+    "lines": 86,
+    "role": "检测器库核心模块（P3 复用）",
+    "stability": "snapshot"
+   },
+   {
+    "path": "2026-11-16/detector-lib/detlib/pipeline.py",
+    "sha256": "eabadf270572799994083df9a928cdeb3f7db04a0d6e15a58ff7231e91e227e9",
+    "lines": 230,
+    "role": "检测器库核心模块（P3 复用）",
+    "stability": "snapshot"
+   },
+   {
+    "path": "2026-11-16/detector-lib/detlib/reference.py",
+    "sha256": "531ddad57cfe76f165ac6374cefaa6ec431e38cc1d7a5d34a7a81cb6f45e1b1d",
+    "lines": 164,
+    "role": "检测器库核心模块（P3 复用）",
+    "stability": "snapshot"
+   },
+   {
+    "path": "2026-11-16/detector-lib/detlib/registry.py",
+    "sha256": "270ebce834273a55904b98ba4268d1029287d3dc1778871e1a404619687c35b5",
+    "lines": 434,
+    "role": "检测器库核心模块（P3 复用）",
+    "stability": "snapshot"
+   },
+   {
+    "path": "2026-11-16/detector-lib/detlib/thresholds.py",
+    "sha256": "78ea17fe681264d63c96b8e0a505fa2cd7370548fbf859cb898b7a22e5332314",
+    "lines": 88,
+    "role": "检测器库核心模块（P3 复用）",
+    "stability": "snapshot"
+   },
+   {
+    "path": "2026-11-16/drift-benchmark/bench_lib.py",
+    "sha256": "49458c26602b210bb539003942c9be3ea1f503b44f30ad05c628d9519077c806",
+    "lines": 569,
+    "role": "漂移基准库（P3 复用）",
+    "stability": "frozen"
+   },
+   {
+    "path": "2026-11-16/drift-benchmark/report.md",
+    "sha256": "cf158dbaa9b8c1a6a8fcfc362e37b1919778fdd96042604eb7686ef742a62a63",
+    "lines": 319,
+    "role": "漂移基准结论（P3 判据来源）",
+    "stability": "frozen"
+   },
+   {
+    "path": "2026-11-16/multitask-feasibility/outputs/分段路由可行性核查.md",
+    "sha256": "b3ead07346ebc7d2a3c27ab174bca355a66fa90b6b748bc538cbf360df80ac9c",
+    "lines": 421,
+    "role": "分段路由可行性证据（P4 前置）",
+    "stability": "frozen"
+   },
+   {
+    "path": "2026-11-16/paper-intake-batch1/outputs/汇总表.md",
+    "sha256": "47de3952e17a32f275ba64dacd33f80725ea6fadd6f89fbb543f223259e46a97",
+    "lines": 76,
+    "role": "论文摄入批 1 汇总（P2 候选来源）",
+    "stability": "frozen"
+   },
+   {
+    "path": "2026-11-16/stream-contract-segmenter/outputs/SDK-1.0.2对照清单.md",
+    "sha256": "2b7ac713a324a8e04b85ecb7e841ce007824dbce60d77a6a261867e2a5c806a0",
+    "lines": 146,
+    "role": "SDK 1.0.2 契约差异清单（v2 入口验收依据）",
+    "stability": "snapshot"
+   },
+   {
+    "path": "2026-11-16/stream-contract-segmenter/outputs/official_entry.py",
+    "sha256": "4d8dd368f6659c2f5c96a8e3d17591cdc7e1a4f3c8c44b65cc444dca998cd459",
+    "lines": 214,
+    "role": "v1 官方入口实现（v2 predict 重写来源）",
+    "stability": "snapshot"
+   }
+  ]
+ },
+ "build": {
+  "builder": "contest-v2 P2（人工 + 本地假宿主 / rnd 替身验收）",
+  "host_os": "Windows-11-10.0.26200-SP0",
+  "python": "3.12.7",
+  "numpy": "2.5.4",
+  "notes": "入口按 SDK 1.0.2 说明的固定形态书写；镜像内应使用 SDK 自带的 template/harness.py，本仓的 app/harness.py 为等价本地实现。P1 起 app/ 增加 actions.py / detectors.py / selector.py / train_stage.py；P2 起增加 train_round.py（一轮训练流程 + 账本），contest_submission.train 延迟委托，describe / predict 不加载训练侧模块。"
+ },
+ "candidate_budget": {
+  "limit_files": 64,
+  "limit_bytes": 67108864,
+  "app_dir_files": 7,
+  "app_dir_bytes": 82291
+ },
+ "acceptance": {
+  "host_double": "tests/fake_host.py",
+  "suite": "tests/test_p0.py",
+  "cases": 25,
+  "result": "25 passed",
+  "covered": [
+   "describe 单行 JSON、字段与 tasks 取值（两个 task）",
+   "describe 导入无副作用（无 CONTEST_ARTIFACT_PATH 也成功）",
+   "导入后 /app 文件集合不变、无任何 .pyc",
+   "train 留接口：exit 3、stdout 为空",
+   "predict 逐行读→写→flush（流式，未等待 EOF）",
+   "分类 label 唯一非空、score∈[0,1]、最高分唯一",
+   "并列按 label 字典序 tie-break，两次运行结果一致",
+   "回归负值 clip 到 0",
+   "stdout 只含协议 JSONL",
+   "上下文 task 优先于行 task：两者不符仍按上下文正常推断",
+   "上下文与行 task 都缺 → 用产物 task，stderr 标注",
+   "坏 JSON / 未知 task / 行 task 与产物不符 → 仍出一行，走声明默认",
+   "分类兜底：先验多数类 score=1.0、其余 0.0、形状与正常行一致",
+   "回归兜底：先验均值",
+   "兜底确定性：同一行两次运行逐字节一致",
+   "兜底不扰动后续行：[好行, 坏行, 同一好行] 第 1 行与第 3 行逐字节相同",
+   "混合批次：非空输入行数 == 输出行数",
+   "上下文 task 与产物 task 冲突 → 逐行声明默认、exit 0、不吞行",
+   "缺 CONTEST_ARTIFACT_PATH、检查点形状不符 → exit 1",
+   "空行跳过",
+   "候选目录 ≤64 文件 / ≤min(64 MiB, 宿主限额)，读不到宿主值时按 64 MiB"
+  ]
+ },
+ "scope": {
+  "included": [
+   "describe",
+   "predict（总输出 + 声明默认）",
+   "形状归属 上下文 > 行 > 产物",
+   "P1：批级检测下沉 train、predict 只留因果动作、selector_trace",
+   "P2：SDK 训练循环、模型真提案、五字段账本、状态/回滚、R1 固定续训父检查点",
+   "加固：确定性审计、载入期常量预计算、回合策略悲观界",
+   "本地假宿主 + rnd 替身验收",
+   "v1 hash 钉定"
+  ],
+  "excluded": [
+   "真实权重训练（P3）",
+   "P3–P4",
+   "任何真实平台运行"
+  ]
+ }
+}

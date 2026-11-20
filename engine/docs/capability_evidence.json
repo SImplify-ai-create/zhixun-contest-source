@@ -1,0 +1,44 @@
+{
+  "schema": "capability-evidence/1",
+  "note": "已落盘的测量值快照。判定函数只读本文件内容，不读盘上其它文件；改本文件才会改变判定。",
+  "detector_migration": {
+    "auc_visible": 0.8093,
+    "auc_unseen_labeled": 0.6848,
+    "auc_unseen_worst": 0.5808,
+    "auc_old_checker": 0.5323,
+    "source": "2026-11-19/product-brief/outputs/作品全景说明.md#L91（原始报告 2026-11-17/multi-visible-fix 已不在盘上）"
+  },
+  "kalman_ablation": {
+    "shapley_rmse_delta": 1.533595,
+    "better_units": 15,
+    "worse_units": 91,
+    "n_units": 106,
+    "source": "2026-11-19/product-brief/outputs/作品全景说明.md#L680-L681（ΔRMSE 为正=更差）"
+  },
+  "action_calibration_v2": {
+    "loo_hit": 0.56,
+    "constant_baseline_hit": 0.48,
+    "out_of_table_fallback": null,
+    "source": "2026-11-19/product-brief/outputs/作品全景说明.md#L697；cutoff 见设计文档 §4"
+  },
+  "uncertainty_abstention": {
+    "delta_is": -0.255,
+    "ci_low": -0.599,
+    "ci_high": 0.165,
+    "nmi": 0.0817,
+    "source": "2026-11-19/product-brief/outputs/作品全景说明.md#L687-L689"
+  },
+  "sequential_cusum": {
+    "cusum_k": null,
+    "cusum_h": null,
+    "source": "2026-11-16/detector-lib/detlib/config.py#L51-L52"
+  },
+  "run_budget": {
+    "total_rounds": 10,
+    "closed_rounds": 6,
+    "source": "2026-11-17/contest-v2/app/llm_cage.py#L41-L42"
+  },
+  "gpr_degradation": null,
+  "meeker_degradation": null,
+  "online_learning": null
+}

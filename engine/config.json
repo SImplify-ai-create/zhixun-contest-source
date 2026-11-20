@@ -1,0 +1,71 @@
+{
+  "data": {
+    "source": "synthetic",
+    "drift_type": "sudden",
+    "data_dir": "data/official",
+    "split": "val",
+    "target_col": "y"
+  },
+  "stream": {
+    "batch_size": 200,
+    "init_batches": 3
+  },
+  "pipeline": {
+    "model_type": "mlp",
+    "window_size": 600,
+    "residual_factor": 3.0,
+    "max_retrains": 6,
+    "label_budget": 4000,
+    "clean_keep_ratio_covariate": 0.7,
+    "clean_keep_ratio_concept": 0.0,
+    "incremental_epochs": 20,
+    "attribution": true,
+    "attribution_every": 2,
+    "min_relative_gain": 0.03,
+    "hist_max": 5000,
+    "max_mahalanobis_dim": 100,
+    "use_rate_window": true,
+    "use_budget_pacing": true,
+    "pacing_trigger": "pressure",
+    "gate_mode": "holdout",
+    "accept_ratio": 0.2,
+    "accept_min": 30,
+    "static_margin": 0.05,
+    "apd_enabled": true,
+    "apd_k": 8,
+    "apd_max_suppress": 6,
+    "apd_stable_z": 2.0,
+    "gradual_window": 1,
+    "gradual_label_ratio": 0.5,
+    "retention_rollback": false,
+    "soft_quota": true,
+    "soft_quota_incremental_ratio": 0.6,
+    "soft_quota_floor": 120,
+    "eval_labels_free": true,
+    "fast_recovery": "a2",
+    "task_fuse": "or",
+    "class_buffer_per_class": 20
+  },
+  "detector": {
+    "mmd_z_threshold": 3.0,
+    "ks_alpha": 0.05,
+    "ks_effect_min": 0.1,
+    "tier_bounds": [
+      1.0,
+      3.0
+    ],
+    "psi_top_k": 0
+  },
+  "decision": {
+    "mode": "threshold",
+    "strategy": "threshold",
+    "calib_path": "runs/action_calibration.json",
+    "cost_label": 0.0001
+  },
+  "logging": {
+    "project": "zhixun-engine",
+    "out_dir": "runs",
+    "experiment_name": null,
+    "swanlab": true
+  }
+}

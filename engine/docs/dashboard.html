@@ -1,0 +1,574 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>智训引擎 · 漂移自进化演示仪表盘</title>
+<style>
+  :root{--bg:#0b1220;--card:#121a2b;--line:#233047;--txt:#dbe4f3;--dim:#8fa0bd;
+        --cyan:#4fd1e0;--amber:#f6b352;--rose:#f07178;--green:#7bd88f;--violet:#a78bfa}
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{background:var(--bg);color:var(--txt);font:14px/1.6 "Microsoft YaHei",system-ui,sans-serif;padding:28px 4vw 60px}
+  h1{font-size:24px;letter-spacing:1px}
+  h1 span{color:var(--cyan)}
+  .sub{color:var(--dim);font-size:12.5px;margin:6px 0 22px}
+  .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:24px}
+  .kpi{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+  .kpi b{display:block;font-size:26px;font-weight:700;color:var(--cyan)}
+  .kpi b.hot{color:var(--rose)} .kpi b.warm{color:var(--amber)} .kpi b.ok{color:var(--green)}
+  .kpi i{font-style:normal;color:var(--dim);font-size:12px}
+  section{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px 22px;margin-bottom:22px}
+  section h2{font-size:16px;margin-bottom:4px}
+  section .desc{color:var(--dim);font-size:12.5px;margin-bottom:14px}
+  .tag{display:inline-block;font-size:11px;padding:1px 8px;border-radius:8px;border:1px solid var(--line);color:var(--dim);margin-left:8px;vertical-align:2px}
+  svg{width:100%;height:auto;display:block}
+  .legend{display:flex;gap:18px;flex-wrap:wrap;color:var(--dim);font-size:12px;margin-top:8px}
+  .legend s{text-decoration:none;display:inline-block;width:14px;height:4px;border-radius:2px;margin-right:6px;vertical-align:3px}
+  .legend u{text-decoration:none;display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px;vertical-align:0}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{padding:7px 10px;border-bottom:1px solid var(--line);text-align:right}
+  th{color:var(--dim);font-weight:600} th:first-child,td:first-child{text-align:left}
+  tr.hl td{color:var(--green)}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px}
+  .vcard{border:1px solid var(--line);border-radius:12px;padding:14px 16px;background:#0e1626}
+  .vcard h3{font-size:14px;margin-bottom:6px}
+  .vcard p{color:var(--dim);font-size:12.5px}
+  .vcard .st{font-size:11px;padding:1px 8px;border-radius:8px;margin-left:6px}
+  .st.on{background:#12351f;color:var(--green)} .st.opt{background:#3a2f10;color:var(--amber)}
+  .disc{color:var(--amber);font-size:12.5px;margin-top:12px;line-height:1.9}
+  .foot{color:var(--dim);font-size:11.5px;margin-top:8px;text-align:center}
+  .btn{background:#0e1626;border:1px solid var(--line);color:var(--dim);border-radius:8px;
+       padding:5px 14px;cursor:pointer;font-size:12.5px;margin-right:8px}
+  .btn.on{border-color:var(--cyan);color:var(--cyan);font-weight:700}
+  .bar{height:9px;border-radius:6px;background:#1c2740;overflow:hidden;position:relative}
+  .bar>i{display:block;height:100%;border-radius:6px}
+  .prog{display:grid;grid-template-columns:1.5fr 3fr 2.4fr 2.4fr 1fr;gap:10px;align-items:center;
+        font-size:12.5px;padding:7px 0;border-bottom:1px solid var(--line)}
+  .prog .m{color:var(--txt)} .prog .m small{color:var(--dim)}
+  .prog .num{color:var(--dim);font-size:11.5px}
+  .chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:6px}
+  .chip{font-size:11.5px;padding:3px 10px;border-radius:8px;border:1px solid var(--line);color:var(--dim)}
+  .chip.done{background:#12351f;border-color:#1f5c37;color:var(--green)}
+  .cmd{background:#0a101c;border:1px solid var(--line);border-radius:8px;padding:10px 14px;
+       font-family:Consolas,monospace;font-size:12.5px;color:#b8c7e0;line-height:1.9;white-space:pre-wrap}
+  .note{color:var(--amber);font-size:12px;margin-top:10px}
+</style>
+</head>
+<body>
+<section id="rerunSection" style="border:1px solid var(--cyan)">
+  <h2>⚡ 现场重跑实验 <span class="tag" id="rrTag" style="border-color:var(--cyan);color:var(--cyan)">需通过 serve_console.py 启动</span></h2>
+  <div class="desc">答辩现场可一键重跑指定模型×漂移场景，实验结果实时刷新到 KPI、RMSE 曲线、双路监测图、tier 时间线与三模型对照表。启动方式：<code style="color:var(--amber)">py scripts/serve_console.py</code>，然后访问 <code style="color:var(--amber)">http://127.0.0.1:8900/dashboard.html</code>。</div>
+  <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+    <label style="color:var(--dim);font-size:12.5px">模型：
+      <select id="rrModel" class="btn" style="padding:4px 8px">
+        <option value="mlp">MLP（反应式）</option>
+        <option value="kalman">卡尔曼（方案A）</option>
+        <option value="hybrid">混合B</option>
+      </select>
+    </label>
+    <label style="color:var(--dim);font-size:12.5px">漂移：
+      <select id="rrDrift" class="btn" style="padding:4px 8px">
+        <option value="sudden">突变</option>
+        <option value="gradual">渐变</option>
+      </select>
+    </label>
+    <button id="btnRerunGo" class="btn" style="background:#12351f;border-color:var(--green);color:var(--green);font-weight:700">▶ 开始重跑</button>
+    <button id="btnRerunStop" class="btn" style="display:none">■ 停止</button>
+    <span id="rrStatus" style="color:var(--dim);font-size:12px"></span>
+  </div>
+  <pre id="rrLog" style="display:none;margin-top:12px;max-height:180px;overflow-y:auto;background:#0a0f1c;border:1px solid var(--line);border-radius:8px;padding:10px"></pre>
+</section>
+<div class="kpis" id="kpis"></div>
+<section>
+  <h2>② 三模型 RMSE 恢复曲线 <span class="tag" id="f1"></span></h2>
+  <div class="desc">同一漂移流、同一闭环闸门，只换预测模型。虚线 = 噪声下限 0.1（理论最优）；竖虚线 = 真实漂移点；圆点 = 重训动作发生批。切场景看两条曲线族。</div>
+  <div style="margin:10px 0 6px">
+    <button class="btn on" id="btnS" data-d="sudden">突变漂移</button>
+    <button class="btn" id="btnG" data-d="gradual">渐变漂移</button>
+    <span class="tag" id="metricTag">卡尔曼/混合为逐样本一步预测口径</span>
+  </div>
+  <div id="chart-rmse"></div>
+  <div class="legend" id="legRmse"></div>
+  <div class="note">口径提醒：MLP 的 eval_rmse 是「批末模型在整批上的静态误差」；卡尔曼/混合开启 continuous_tracking，eval_rmse 是「逐样本一步预测误差」。两者都用于同一恢复曲线对比，但卡尔曼侧不含事后拟合，口径更严。</div>
+</section>
+<section>
+  <h2>③ 解耦式双路漂移监测（创新点 1）</h2>
+  <div class="desc">监控信号与模型更新回路解耦：冻结参考编码器 + 结构路 MMD² z 分数（3σ 自校准阈值）+ 边际路 KS 检验（Bonferroni）。双路同时报警才确认漂移——空流 90 批误报 0 次。图取 MLP 突变 seed42 代表流。</div>
+  <div id="chart-mmd"></div>
+  <div class="legend"><s style="background:var(--cyan)"></s>MMD² z 分数<s style="background:var(--rose)"></s>报警线 z=3.0<u style="background:var(--amber)"></u>双路确认漂移</div>
+  <div id="chart-ks" style="margin-top:16px"></div>
+  <div class="legend"><s style="background:var(--green)"></s>KS 校正后 p 值（对数轴）<s style="background:var(--rose)"></s>显著性线 α=0.05</div>
+</section>
+<section>
+  <h2>④ 漂移严重度分档（创新点 2）</h2>
+  <div class="desc">连续严重度 → observe（不重训）/ incremental（增量微调，保留 0.7 旧标签）/ full（清洗后全量，保留率 0）。分档只在残差恶化时升到 full，输入侧证据封顶 2.6。图取 MLP 突变代表流。</div>
+  <div id="chart-tierline"></div>
+  <div class="legend" id="tierleg"></div>
+</section>
+<section>
+  <h2>⑤ 三模型横向对照（3 种子均值）</h2>
+  <div class="desc">末段 = 最后 5 批均值；峰值 = 全流最大；Δ 为相对同场景 MLP 的末段变化。卡尔曼的收益来自线性假设，适用性由官方数据 Ridge R² 检验决定。</div>
+  <table id="tbl-model"></table>
+  <div class="note">读法：渐变场景 MLP 1.441 → 卡尔曼 0.140，降幅约 90%，已贴近噪声下限 0.1；混合 B 在纯线性合成流上非最优，定位是真实非线性数据的保险。</div>
+</section>
+<section>
+  <h2>⓪ 线路图：一个受控的闭环（每一格都标了输入、判定条件与输出）</h2>
+  <div class="desc">上层是数据进入，中层是五阶段闭环，下层是预算约束与可切换的预测模型。红色虚线是闭环回流：回滚/上线后继续监测下一批，不等下一轮离线重训。</div>
+  <div id="diagram"></div>
+</section>
+<section>
+  <h2>① 实验进度 <span class="tag" id="progTag"></span></h2>
+  <div class="desc">实验矩阵 = 3 模型 × 2 场景 × 3 种子 = 18 次独立运行。总进度条按已完成运行数计；明细行同时展示数据流推进、标注预算消耗与重训槽位占用。</div>
+  <div style="display:flex;align-items:center;gap:14px;margin-bottom:6px">
+    <div class="bar" style="flex:1"><i id="progAll" style="background:linear-gradient(90deg,#4fd1e0,#7bd88f)"></i></div>
+    <b id="progTxt" style="font-size:13px;color:var(--green)"></b>
+  </div>
+  <div class="chips" id="progChips"></div>
+  <div style="height:14px"></div>
+  <div id="progRows"></div>
+</section>
+<section>
+  <h2>⑥ 三档命中分布：多档漂移生成器验证</h2>
+  <div class="desc">TieredDriftStream 只改"什么变了"：纯域偏移（P(X)变）期望 observe/incremental、浅概念漂移期望 incremental、深概念漂移期望 full——命中分布非退化，分档真的在分。</div>
+  <div id="chart-tierhit"></div>
+  <div class="legend" id="hitleg"></div>
+</section>
+<section>
+  <h2>⑦ 补充实验：分级动作对照 / 消融</h2>
+  <div class="desc">把每条流分别强制只用某一种动作，得到"该花多少钱、能修到多好"的对照（J = 末段RMSE + 1e-4×标注）。下表为消融：去掉归因（no2）与完整系统对照。</div>
+  <table id="tbl-act"></table>
+  <div style="height:14px"></div>
+  <table id="tbl-abl"></table>
+  <div style="height:14px"></div>
+  <table id="tbl-i45"></table>
+</section>
+<section>
+  <h2>⑧ S2 模型训练：快速恢复 / 条件切换 / 标签账本 <span class="tag">2026-11-04</span></h2>
+  <div class="desc">fast_recovery=a2：高置信漂移（双路报警 OR 残差&gt;4×基线）时恢复期 cooldown 从 3 批降到 1 批；ConditionalPipeline 以 Ridge 起步、full 漂移切 MLP；LabelLedger 样本 ID 级计费不重复扣费。</div>
+  <div class="cards">
+    <div class="vcard"><h3>fast_recovery 三模式对照 <span class="st on">已验证</span></h3>
+      <p>突变/渐变 × off/a1/a2（seed=42）：三模式指标一致——稀疏漂移下 cooldown 缩短不改变重训决策；a2 模式 fast_recovery 事件在突变中正常触发 2 次。密集漂移场景恢复更快。</p>
+      <table id="tbl-fr" style="margin-top:8px"></table>
+    </div>
+    <div class="vcard"><h3>端到端主链路 <span class="st on">已通过</span></h3>
+      <p>默认 fast_recovery=a2 + alpha=0.001，突变末段 0.169（劣基 3/27）、渐变末段 1.308（劣基 0/27），12 单元测试全过。</p>
+    </div>
+    <div class="vcard"><h3>Kalman F/Q 缓存 <span class="st opt">纯优化</span></h3>
+      <p>F、Q 矩阵从每批 track() 重建改为 _reset() 构造一次，数值等价、长流累计省开销。</p>
+    </div>
+  </div>
+</section>
+<section>
+  <h2>⑨ S2.1 超参数选择：AutoHPO-Lite 8 候选网格 <span class="tag">2026-11-04</span></h2>
+  <div class="desc">2 隐藏层 × 2 lr × 2 alpha = 8 组（任务书上限）；时间隔离切分（train 前 70%、val 后 30%，无未来泄漏）；每次拟合如实计为 1 次训练，记录 CPU/墙钟。6 流 × 8 候选 = 48 次训练，墙钟 ~30s。</div>
+  <table id="tbl-hpo"></table>
+  <div class="disc">最优 (64,32)/lr0.01/alpha<b>0.001</b>，val RMSE 0.1556，已设为默认。lr=0.01 全面优于 0.001；alpha=0.001 相对旧默认 0.0001 提升约 2.9%。</div>
+</section>
+<section>
+  <h2>⑩ 运行与复现（不走展示台也能跑）</h2>
+  <div class="desc">展示台只读 runs/，不参与推理。真实跑批用命令行或控制台，产物统一落在 runs/。</div>
+  <div class="cmd"># A. 官方数据包放到 data/official/（文件名 val.csv / val.npz / val.npy 均可）
+python scripts/run_pipeline.py --source official --data-dir data/official --split val --model kalman --no-swanlab
+
+# B. 合成流复现（三模型三种子）
+python scripts/run_pipeline.py --drift sudden  --model mlp    --seed 42 --no-swanlab --experiment-name mlp-sudden-s42
+python scripts/run_pipeline.py --drift gradual --model kalman --seed 42 --no-swanlab --experiment-name kal-sudden-s42
+
+# C. 重新生成本页（数据来自 runs/）
+python scripts/build_dashboard.py --skip-probe</div>
+  <div class="note">结果位置：控制台汇总（峰值/末段/重训/标注）+ runs/&lt;实验名&gt;-&lt;时间戳&gt;.csv（逐批明细）+ -summary.json + report-&lt;实验名&gt;.png（曲线图）。</div>
+</section>
+<div class="sub">漂移监测 → 诊断归因 → 分级重训练 → 评估上线 → 回滚 ｜ 三模型对照（MLP / 卡尔曼 A / 混合 B）｜ 数据全部来自 runs/ 真实实验（<span id="gen"></span> 生成）</div>
+<div class="foot">生成脚本 scripts/build_dashboard.py ｜ 数据：runs/（三模型 × 两场景 × 3 种子）｜ 空跑误报与紧预算结论见《方案版本说明》</div>
+<h1>智训引擎 · <span>漂移自进化</span>演示仪表盘</h1>
+<script>
+const D = {"generated": "2026-11-03 23:07:17", "models": {"mlp": {"label": "MLP 反应式", "prefix": "baseline", "sudden": {"kpi": {"tail": 0.19, "peak": 7.286, "labels": 1833, "retrains": 3.3, "n_seeds": 3}, "curve": [0.1675, 0.1653, 0.1704, 0.1787, 0.1692, 0.1708, 0.1765, 4.6368, 4.5198, 4.5732, 4.5972, 4.6129, 0.1499, 0.142, 0.1453, 0.1461, 0.1605, 6.2808, 3.7545, 3.6591, 3.7344, 3.8981, 0.1578, 0.1844, 0.209, 0.1978, 0.2004], "batches": [0, 200, 400, 600, 800, 1000, 1200, 1400, 1600, 1800, 2000, 2200, 2400, 2600, 2800, 3000, 3200, 3400, 3600, 3800, 4000, 4200, 4400, 4600, 4800, 5000, 5200], "rep": {"batches": [600.0, 800.0, 1000.0, 1200.0, 1400.0, 1600.0, 1800.0, 2000.0, 2200.0, 2400.0, 2600.0, 2800.0, 3000.0, 3200.0, 3400.0, 3600.0, 3800.0, 4000.0, 4200.0, 4400.0, 4600.0, 4800.0, 5000.0, 5200.0, 5400.0, 5600.0, 5800.0], "rmse": [0.1753, 0.1673, 0.1765, 0.1938, 0.1726, 0.1847, 0.1914, 4.223, 4.0111, 4.3344, 4.2407, 4.3219, 0.1512, 0.1371, 0.1489, 0.157, 0.1728, 7.9965, 0.2362, 0.209, 0.1797, 0.1733, 0.1636, 0.1972, 0.3111, 0.2078, 0.1849], "mmd_z": [-0.94, -0.4, -0.19, -1.35, -1.38, 0.23, -0.65, 201.0, 220.95, 212.54, 210.9, 198.67, -0.29, 1.82, -1.64, 0.83, 0.04, 260.87, 255.51, 273.28, 258.92, 252.54, 264.96, 261.46, 250.05, 249.16, 252.9], "ks_p": [0.627, 1.0, 0.326, 0.77, 1.0, 1.0, 0.159, 2.09e-68, 7.86e-76, 8.02e-81, 2.73e-84, 1.5e-79, 0.627, 0.00178, 1.0, 1.0, 0.851, 4.06e-91, 1.02e-89, 5.62e-94, 1.78e-101, 1.37e-91, 1.78e-101, 2.06e-98, 5.63e-83, 5.62e-94, 1.2e-90], "tiers": ["none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none"], "dual": [false, false, false, false, false, false, false, true, true, true, true, true, false, false, false, false, false, true, true, true, true, true, true, true, true, true, true], "drift_points": [], "retrains": [3000.0, 4000.0, 5000.0], "file": "baseline-sudden-s42-1103-230155.csv"}, "seeds": [{"seed": 42, "tail": 0.2129, "peak": 7.996, "labels": 2300, "retrains": 4, "file": "baseline-sudden-s42-1103-230155.csv", "n": 27}, {"seed": 7, "tail": 0.1454, "peak": 5.72, "labels": 1800, "retrains": 3, "file": "baseline-sudden-s7-1103-230212.csv", "n": 27}, {"seed": 2024, "tail": 0.2114, "peak": 8.141, "labels": 1400, "retrains": 3, "file": "baseline-sudden-s2024-1103-230229.csv", "n": 27}]}, "gradual": {"kpi": {"tail": 1.441, "peak": 2.387, "labels": 1820, "retrains": 4.7, "n_seeds": 3}, "curve": [0.1675, 0.1653, 0.1704, 0.1787, 0.1692, 0.1708, 0.1765, 0.3472, 0.6802, 1.0007, 1.3231, 1.5909, 0.5229, 0.7808, 1.0806, 1.458, 0.5404, 0.6591, 0.9154, 1.3017, 0.6686, 1.1313, 1.3875, 1.7586, 0.9475, 1.378, 1.7357], "batches": [0, 200, 400, 600, 800, 1000, 1200, 1400, 1600, 1800, 2000, 2200, 2400, 2600, 2800, 3000, 3200, 3400, 3600, 3800, 4000, 4200, 4400, 4600, 4800, 5000, 5200], "rep": {"batches": [600.0, 800.0, 1000.0, 1200.0, 1400.0, 1600.0, 1800.0, 2000.0, 2200.0, 2400.0, 2600.0, 2800.0, 3000.0, 3200.0, 3400.0, 3600.0, 3800.0, 4000.0, 4200.0, 4400.0, 4600.0, 4800.0, 5000.0, 5200.0, 5400.0, 5600.0, 5800.0], "rmse": [0.1753, 0.1673, 0.1765, 0.1938, 0.1726, 0.1847, 0.1914, 0.3101, 0.4859, 0.5812, 0.549, 0.442, 0.5839, 0.4537, 0.6631, 0.5397, 0.4885, 0.3841, 0.8587, 1.3156, 0.6254, 0.9251, 0.7846, 0.856, 1.3532, 1.712, 1.8251], "mmd_z": [-0.94, -0.4, -0.19, -1.35, -1.38, 0.23, -0.65, 201.0, 220.95, 212.54, 210.9, 198.67, 204.82, 208.13, 204.14, 211.72, 207.95, 426.14, 429.03, 443.51, 434.14, 434.08, 438.33, 442.32, 428.42, 432.12, 431.21], "ks_p": [0.627, 1.0, 0.326, 0.77, 1.0, 1.0, 0.159, 2.09e-68, 7.86e-76, 8.02e-81, 2.73e-84, 1.5e-79, 3.94e-79, 2e-75, 2.77e-67, 1.82e-77, 3e-81, 7.34e-172, 3.42e-165, 2.98e-166, 3.77e-164, 4.08e-162, 7.34e-172, 2.49e-167, 3.54e-159, 4.08e-162, 4.02e-161], "tiers": ["none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none"], "dual": [false, false, false, false, false, false, false, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true], "drift_points": [], "retrains": [2000.0, 3000.0, 4000.0, 5000.0], "file": "baseline-gradual-s42-1103-230242.csv"}, "seeds": [{"seed": 42, "tail": 1.3062, "peak": 1.825, "labels": 2600, "retrains": 5, "file": "baseline-gradual-s42-1103-230242.csv", "n": 27}, {"seed": 7, "tail": 1.0413, "peak": 2.332, "labels": 1460, "retrains": 4, "file": "baseline-gradual-s7-1103-230254.csv", "n": 27}, {"seed": 2024, "tail": 1.9769, "peak": 3.005, "labels": 1400, "retrains": 5, "file": "baseline-gradual-s2024-1103-230318.csv", "n": 27}]}}, "kalman": {"label": "卡尔曼 A", "prefix": "kfreg", "sudden": {"kpi": {"tail": 0.14, "peak": 1.334, "labels": 1000, "retrains": 2.3, "n_seeds": 3}, "curve": [0.1636, 0.1288, 0.133, 0.1384, 0.1354, 0.129, 0.129, 1.1067, 0.1333, 0.1401, 0.1394, 0.1438, 0.1376, 0.1361, 0.136, 0.1359, 0.14, 1.182, 0.1505, 0.147, 0.1497, 0.1376, 0.1366, 0.135, 0.1429, 0.1358, 0.1503], "batches": [0, 200, 400, 600, 800, 1000, 1200, 1400, 1600, 1800, 2000, 2200, 2400, 2600, 2800, 3000, 3200, 3400, 3600, 3800, 4000, 4200, 4400, 4600, 4800, 5000, 5200], "rep": {"batches": [600.0, 800.0, 1000.0, 1200.0, 1400.0, 1600.0, 1800.0, 2000.0, 2200.0, 2400.0, 2600.0, 2800.0, 3000.0, 3200.0, 3400.0, 3600.0, 3800.0, 4000.0, 4200.0, 4400.0, 4600.0, 4800.0, 5000.0, 5200.0, 5400.0, 5600.0, 5800.0], "rmse": [0.1564, 0.1195, 0.1356, 0.1346, 0.1308, 0.1349, 0.1361, 0.9837, 0.1421, 0.1409, 0.1387, 0.145, 0.1455, 0.1456, 0.1306, 0.1403, 0.1323, 1.316, 0.1564, 0.1423, 0.1442, 0.1432, 0.1394, 0.1376, 0.1348, 0.125, 0.1581], "mmd_z": [-0.94, -0.4, -0.19, -1.35, -1.38, 0.23, -0.65, 201.0, 220.95, 212.54, 210.9, 198.67, 204.82, 208.13, 204.14, 211.72, 207.95, 426.14, 429.03, 443.51, -0.54, -0.85, -2.51, 0.44, -1.06, 0.1, -1.06], "ks_p": [0.627, 1.0, 0.326, 0.77, 1.0, 1.0, 0.159, 2.09e-68, 7.86e-76, 8.02e-81, 2.73e-84, 1.5e-79, 3.94e-79, 2e-75, 2.77e-67, 1.82e-77, 3e-81, 7.34e-172, 3.42e-165, 2.98e-166, 0.408, 0.408, 1.0, 1.0, 0.627, 0.0733, 1.0], "tiers": ["none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none"], "dual": [false, false, false, false, false, false, false, true, true, true, true, true, true, true, true, true, true, true, true, true, false, false, false, false, false, false, false], "drift_points": [], "retrains": [4600.0], "file": "kfreg-sudden-s42-1103-205610.csv"}, "seeds": [{"seed": 42, "tail": 0.139, "peak": 1.316, "labels": 960, "retrains": 2, "file": "kfreg-sudden-s42-1103-205610.csv", "n": 27}, {"seed": 7, "tail": 0.1404, "peak": 1.216, "labels": 960, "retrains": 2, "file": "kfreg-sudden-s7-1103-205634.csv", "n": 27}, {"seed": 2024, "tail": 0.141, "peak": 1.469, "labels": 1080, "retrains": 3, "file": "kfreg-sudden-s2024-1103-205658.csv", "n": 27}]}, "gradual": {"kpi": {"tail": 0.14, "peak": 0.164, "labels": 880, "retrains": 2.0, "n_seeds": 3}, "curve": [0.1636, 0.1288, 0.133, 0.1384, 0.1354, 0.129, 0.129, 0.1397, 0.1333, 0.1401, 0.1394, 0.1438, 0.1371, 0.1361, 0.136, 0.1359, 0.14, 0.14, 0.1505, 0.147, 0.1497, 0.1376, 0.1366, 0.135, 0.1429, 0.1358, 0.1503], "batches": [0, 200, 400, 600, 800, 1000, 1200, 1400, 1600, 1800, 2000, 2200, 2400, 2600, 2800, 3000, 3200, 3400, 3600, 3800, 4000, 4200, 4400, 4600, 4800, 5000, 5200], "rep": {"batches": [600.0, 800.0, 1000.0, 1200.0, 1400.0, 1600.0, 1800.0, 2000.0, 2200.0, 2400.0, 2600.0, 2800.0, 3000.0, 3200.0, 3400.0, 3600.0, 3800.0, 4000.0, 4200.0, 4400.0, 4600.0, 4800.0, 5000.0, 5200.0, 5400.0, 5600.0, 5800.0], "rmse": [0.1564, 0.1195, 0.1356, 0.1346, 0.1308, 0.1349, 0.1361, 0.1443, 0.1421, 0.1409, 0.1387, 0.145, 0.1455, 0.1456, 0.1306, 0.1403, 0.1323, 0.1333, 0.1564, 0.1423, 0.1442, 0.1432, 0.1394, 0.1376, 0.1348, 0.125, 0.1581], "mmd_z": [-0.94, -0.4, -0.19, -1.35, -1.38, 0.23, -0.65, 201.0, 220.95, 212.54, 210.9, 198.67, 204.82, 208.13, 204.14, 211.72, 207.95, 426.14, 429.03, 443.51, -0.54, -0.85, -2.51, 0.44, -1.06, 0.1, -1.06], "ks_p": [0.627, 1.0, 0.326, 0.77, 1.0, 1.0, 0.159, 2.09e-68, 7.86e-76, 8.02e-81, 2.73e-84, 1.5e-79, 3.94e-79, 2e-75, 2.77e-67, 1.82e-77, 3e-81, 7.34e-172, 3.42e-165, 2.98e-166, 0.408, 0.408, 1.0, 1.0, 0.627, 0.0733, 1.0], "tiers": ["none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none"], "dual": [false, false, false, false, false, false, false, true, true, true, true, true, true, true, true, true, true, true, true, true, false, false, false, false, false, false, false], "drift_points": [], "retrains": [4600.0], "file": "kfreg-gradual-s42-1103-205721.csv"}, "seeds": [{"seed": 42, "tail": 0.139, "peak": 0.158, "labels": 960, "retrains": 2, "file": "kfreg-gradual-s42-1103-205721.csv", "n": 27}, {"seed": 7, "tail": 0.1404, "peak": 0.176, "labels": 960, "retrains": 2, "file": "kfreg-gradual-s7-1103-205744.csv", "n": 27}, {"seed": 2024, "tail": 0.141, "peak": 0.158, "labels": 720, "retrains": 2, "file": "kfreg-gradual-s2024-1103-205808.csv", "n": 27}]}}, "hybrid": {"label": "混合 B", "prefix": "hyb", "sudden": {"kpi": {"tail": 0.36, "peak": 1.366, "labels": 960, "retrains": 2.0, "n_seeds": 3}, "curve": [0.2666, 0.2168, 0.2294, 0.2405, 0.2151, 0.2271, 0.2304, 1.1206, 0.2808, 0.2853, 0.3128, 0.2909, 0.2895, 0.3007, 0.2915, 0.2927, 0.303, 1.2294, 0.3879, 0.3498, 0.3567, 0.3477, 0.3538, 0.3674, 0.3477, 0.3537, 0.3768], "batches": [0, 200, 400, 600, 800, 1000, 1200, 1400, 1600, 1800, 2000, 2200, 2400, 2600, 2800, 3000, 3200, 3400, 3600, 3800, 4000, 4200, 4400, 4600, 4800, 5000, 5200], "rep": {"batches": [600.0, 800.0, 1000.0, 1200.0, 1400.0, 1600.0, 1800.0, 2000.0, 2200.0, 2400.0, 2600.0, 2800.0, 3000.0, 3200.0, 3400.0, 3600.0, 3800.0, 4000.0, 4200.0, 4400.0, 4600.0, 4800.0, 5000.0, 5200.0, 5400.0, 5600.0, 5800.0], "rmse": [0.2889, 0.214, 0.231, 0.2561, 0.2215, 0.2465, 0.2527, 0.9823, 0.2912, 0.333, 0.3421, 0.294, 0.3228, 0.341, 0.3219, 0.3437, 0.3136, 1.3476, 0.3563, 0.3193, 0.357, 0.298, 0.3104, 0.3306, 0.3319, 0.3584, 0.374], "mmd_z": [-0.94, -0.4, -0.19, -1.35, -1.38, 0.23, -0.65, 201.0, 220.95, 212.54, 210.9, 198.67, -0.29, 1.82, -1.64, 0.83, 0.04, 260.87, 255.51, 273.28, 258.92, 252.54, 264.96, 261.46, 250.05, 249.16, 252.9], "ks_p": [0.627, 1.0, 0.326, 0.77, 1.0, 1.0, 0.159, 2.09e-68, 7.86e-76, 8.02e-81, 2.73e-84, 1.5e-79, 0.627, 0.00178, 1.0, 1.0, 0.851, 4.06e-91, 1.02e-89, 5.62e-94, 1.78e-101, 1.37e-91, 1.78e-101, 2.06e-98, 5.63e-83, 5.62e-94, 1.2e-90], "tiers": ["none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none"], "dual": [false, false, false, false, false, false, false, true, true, true, true, true, false, false, false, false, false, true, true, true, true, true, true, true, true, true, true], "drift_points": [], "retrains": [3000.0], "file": "hyb-sudden-s42-1103-212732.csv"}, "seeds": [{"seed": 42, "tail": 0.3411, "peak": 1.348, "labels": 960, "retrains": 2, "file": "hyb-sudden-s42-1103-212732.csv", "n": 27}, {"seed": 7, "tail": 0.3006, "peak": 1.231, "labels": 1320, "retrains": 3, "file": "hyb-sudden-s7-1103-212805.csv", "n": 27}, {"seed": 2024, "tail": 0.438, "peak": 1.518, "labels": 600, "retrains": 1, "file": "hyb-sudden-s2024-1103-212838.csv", "n": 27}]}, "gradual": {"kpi": {"tail": 0.36, "peak": 0.398, "labels": 840, "retrains": 1.7, "n_seeds": 3}, "curve": [0.2666, 0.2168, 0.2294, 0.2405, 0.2151, 0.2271, 0.2304, 0.2901, 0.2808, 0.2853, 0.3128, 0.2909, 0.2895, 0.3007, 0.2915, 0.2927, 0.303, 0.369, 0.388, 0.3498, 0.3567, 0.3477, 0.3538, 0.3674, 0.3477, 0.3537, 0.3768], "batches": [0, 200, 400, 600, 800, 1000, 1200, 1400, 1600, 1800, 2000, 2200, 2400, 2600, 2800, 3000, 3200, 3400, 3600, 3800, 4000, 4200, 4400, 4600, 4800, 5000, 5200], "rep": {"batches": [600.0, 800.0, 1000.0, 1200.0, 1400.0, 1600.0, 1800.0, 2000.0, 2200.0, 2400.0, 2600.0, 2800.0, 3000.0, 3200.0, 3400.0, 3600.0, 3800.0, 4000.0, 4200.0, 4400.0, 4600.0, 4800.0, 5000.0, 5200.0, 5400.0, 5600.0, 5800.0], "rmse": [0.2889, 0.214, 0.231, 0.2561, 0.2215, 0.2465, 0.2527, 0.3282, 0.2912, 0.333, 0.3421, 0.294, 0.3228, 0.341, 0.3219, 0.3437, 0.3136, 0.3856, 0.3564, 0.3193, 0.357, 0.298, 0.3104, 0.3306, 0.3319, 0.3584, 0.374], "mmd_z": [-0.94, -0.4, -0.19, -1.35, -1.38, 0.23, -0.65, 201.0, 220.95, 212.54, 210.9, 198.67, 204.82, 208.13, 204.14, 211.72, 207.95, 426.14, 429.03, 443.51, 434.14, 434.08, 438.33, 442.32, 428.42, 432.12, 431.21], "ks_p": [0.627, 1.0, 0.326, 0.77, 1.0, 1.0, 0.159, 2.09e-68, 7.86e-76, 8.02e-81, 2.73e-84, 1.5e-79, 3.94e-79, 2e-75, 2.77e-67, 1.82e-77, 3e-81, 7.34e-172, 3.42e-165, 2.98e-166, 3.77e-164, 4.08e-162, 7.34e-172, 2.49e-167, 3.54e-159, 4.08e-162, 4.02e-161], "tiers": ["none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none", "none"], "dual": [false, false, false, false, false, false, false, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true], "drift_points": [], "retrains": [], "file": "hyb-gradual-s42-1103-212909.csv"}, "seeds": [{"seed": 42, "tail": 0.3411, "peak": 0.386, "labels": 600, "retrains": 1, "file": "hyb-gradual-s42-1103-212909.csv", "n": 27}, {"seed": 7, "tail": 0.3006, "peak": 0.328, "labels": 1320, "retrains": 3, "file": "hyb-gradual-s7-1103-212928.csv", "n": 27}, {"seed": 2024, "tail": 0.438, "peak": 0.48, "labels": 600, "retrains": 1, "file": "hyb-gradual-s2024-1103-213002.csv", "n": 27}]}}}, "meta": {"budget": 4000, "max_retrains": 6, "batch_size": 200, "default_model": "mlp", "n_runs_total": 18}, "tierAuto": {"domain_mild": {"tiers": {"observe": 6, "incremental": 3, "full": 0}, "final_mean": 0.177}, "domain": {"tiers": {"observe": 0, "incremental": 4, "full": 0}, "final_mean": 0.1871}, "shallow": {"tiers": {"observe": 0, "incremental": 0, "full": 0}, "final_mean": 0.3165}, "deep": {"tiers": {"observe": 0, "incremental": 1, "full": 6}, "final_mean": 0.1849}}, "calibration": [{"scenario": "deep", "action": "full", "rmse": 0.1799, "labels": 1933.0, "J": 0.3732}, {"scenario": "deep", "action": "incremental", "rmse": 2.7059, "labels": 2133.0, "J": 2.9192}, {"scenario": "deep", "action": "observe", "rmse": 3.369, "labels": 667.0, "J": 3.4356}, {"scenario": "domain", "action": "full", "rmse": 0.1774, "labels": 1700.0, "J": 0.3474}, {"scenario": "domain", "action": "incremental", "rmse": 0.1456, "labels": 2400.0, "J": 0.3856}, {"scenario": "domain", "action": "observe", "rmse": 0.2314, "labels": 1800.0, "J": 0.4114}, {"scenario": "domain_mild", "action": "full", "rmse": 0.1724, "labels": 2200.0, "J": 0.3924}, {"scenario": "domain_mild", "action": "incremental", "rmse": 0.1597, "labels": 1933.0, "J": 0.353}, {"scenario": "domain_mild", "action": "observe", "rmse": 0.1778, "labels": 933.0, "J": 0.2712}, {"scenario": "shallow", "action": "full", "rmse": 0.1796, "labels": 1733.0, "J": 0.3529}, {"scenario": "shallow", "action": "incremental", "rmse": 0.196, "labels": 1400.0, "J": 0.336}, {"scenario": "shallow", "action": "observe", "rmse": 0.3278, "labels": 867.0, "J": 0.4145}], "ablation": {"rows": [{"budget": "loose", "drift": "gradual", "config": "full", "rmse": 2.04, "rmse_std": 1.207, "labels": 3267}, {"budget": "loose", "drift": "gradual", "config": "no2", "rmse": 1.772, "rmse_std": 0.729, "labels": 3400}, {"budget": "loose", "drift": "sudden", "config": "full", "rmse": 0.187, "rmse_std": 0.058, "labels": 2400}, {"budget": "loose", "drift": "sudden", "config": "no2", "rmse": 0.187, "rmse_std": 0.058, "labels": 2400}, {"budget": "tight", "drift": "gradual", "config": "full", "rmse": 3.584, "rmse_std": 1.373, "labels": 1500}, {"budget": "tight", "drift": "gradual", "config": "no2", "rmse": 3.584, "rmse_std": 1.373, "labels": 1500}, {"budget": "tight", "drift": "sudden", "config": "full", "rmse": 2.848, "rmse_std": 3.7, "labels": 1500}, {"budget": "tight", "drift": "sudden", "config": "no2", "rmse": 2.848, "rmse_std": 3.7, "labels": 1500}]}, "innov45": [{"budget": "loose", "drift": "gradual", "config": "base", "rmse": 2.04}, {"budget": "loose", "drift": "gradual", "config": "both", "rmse": 1.395}, {"budget": "loose", "drift": "gradual", "config": "pacing", "rmse": 2.04}, {"budget": "loose", "drift": "gradual", "config": "window", "rmse": 1.395}, {"budget": "loose", "drift": "sudden", "config": "base", "rmse": 0.187}, {"budget": "loose", "drift": "sudden", "config": "both", "rmse": 0.208}, {"budget": "loose", "drift": "sudden", "config": "pacing", "rmse": 0.187}, {"budget": "loose", "drift": "sudden", "config": "window", "rmse": 0.208}, {"budget": "tight", "drift": "gradual", "config": "base", "rmse": 3.584}, {"budget": "tight", "drift": "gradual", "config": "both", "rmse": 3.64}, {"budget": "tight", "drift": "gradual", "config": "pacing", "rmse": 3.62}, {"budget": "tight", "drift": "gradual", "config": "window", "rmse": 3.64}, {"budget": "tight", "drift": "sudden", "config": "base", "rmse": 2.848}, {"budget": "tight", "drift": "sudden", "config": "both", "rmse": 2.836}, {"budget": "tight", "drift": "sudden", "config": "pacing", "rmse": 2.836}, {"budget": "tight", "drift": "sudden", "config": "window", "rmse": 2.836}], "staticFacts": {"false_alarm": "空流 90 批双路误报 0 次（结构路 0%、边际路 2%→联合 0%）", "seeds": "三模型均为 3 种子（42/7/2024）均值"}};
+const C = {cyan:"#4fd1e0",violet:"#a78bfa",amber:"#f6b352",rose:"#f07178",green:"#7bd88f",dim:"#8fa0bd",line:"#233047"};
+const MC = {mlp:C.cyan,kalman:C.amber,hybrid:C.violet};
+const MLABEL = {mlp:"MLP 反应式",kalman:"卡尔曼 A",hybrid:"混合 B"};
+const TIER_C = {observe:"#4fd1e0",incremental:"#f6b352",full:"#f07178",none:"#2a3650"};
+const $ = id => document.getElementById(id);
+$("gen").textContent = D.generated;
+
+/* ---------- KPI ---------- */
+window.renderKpis = function(){
+  const M = D.models, s = M.mlp.sudden.kpi, k = M.kalman.sudden.kpi;
+  const g = M.mlp.gradual.kpi, gk = M.kalman.gradual.kpi, gh = M.hybrid.gradual.kpi;
+  $("kpis").innerHTML = [
+    ["突变末段 · MLP", s.tail, "", "基线反应式 · 3种子"],
+    ["突变末段 · 卡尔曼", k.tail, "ok", "≈ 噪声下限 0.1"],
+    ["渐变末段 · MLP", g.tail, "hot", "漂移追不上 · 3种子"],
+    ["渐变末段 · 卡尔曼", gk.tail, "ok", "相对 MLP −90%"],
+    ["渐变末段 · 混合B", gh.tail, "warm", "非线性保险方案"],
+    ["渐变标注 · 卡尔曼", gk.labels, "", "条 / 预算 " + D.meta.budget],
+    ["渐变重训 · 卡尔曼", gk.retrains, "ok", "次 / 槽位 " + D.meta.max_retrains]
+  ].map(([i,v,c,d])=>`<div class="kpi"><b class="${c}">${v}</b><i>${i}</i><br><i>${d}</i></div>`).join("");
+};
+window.renderKpis();
+
+/* ---------- ⓪ 线路图 ---------- */
+(function(){
+  const box=(x,y,w,h,t,lines,color)=>{
+    let s=`<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="9" fill="#0e1626" stroke="${color}" stroke-width="1.6"/>`;
+    s+=`<rect x="${x}" y="${y}" width="${w}" height="27" rx="9" fill="${color}" opacity=".16"/>`;
+    s+=`<text x="${x+w/2}" y="${y+19}" fill="${color}" font-size="13" font-weight="700" text-anchor="middle">${t}</text>`;
+    lines.forEach((ln,i)=>{s+=`<text x="${x+11}" y="${y+46+i*16}" fill="#8fa0bd" font-size="10.5">${ln}</text>`;});
+    return s;
+  };
+  const arrow=(x1,y,x2,color,label)=>{
+    let s=`<line x1="${x1}" y1="${y}" x2="${x2-8}" y2="${y}" stroke="${color}" stroke-width="1.8"/>`;
+    s+=`<path d="M${x2-9},${y-5} L${x2},${y} L${x2-9},${y+5}" fill="${color}"/>`;
+    if(label) s+=`<text x="${(x1+x2)/2}" y="${y-7}" fill="#8fa0bd" font-size="9.5" text-anchor="middle">${label}</text>`;
+    return s;
+  };
+  let g="";
+  // 数据源层
+  g+=box(40,26,170,64,"① 数据源",["官方包 val.csv/npz/npy","或合成流 synthetic"],C.green);
+  g+=arrow(212,58,246,C.green,"");
+  g+=box(250,26,170,64,"② 数据接入",["OfficialStreamLoader","批流 200 条/批"],C.green);
+  g+=`<line x1="335" y1="90" x2="335" y2="160" stroke="${C.green}" stroke-width="1.8"/>`
+    +`<path d="M330,159 L335,170 L340,159" fill="${C.green}"/>`
+    +`<text x="345" y="132" fill="${C.green}" font-size="9.5">进入流</text>`;
+  // 主闭环
+  const y=170,h=132,w=170;
+  const xs=[40,250,460,670,880];
+  g+=box(xs[0],y,w,h,"③ 漂移监测",["冻结 PCA 参考表征","MMD² z ≥ 3.0","且 KS p < 0.05","→ dual_drift 确认"],C.cyan);
+  g+=box(xs[1],y,w,h,"④ 诊断归因",["KernelSHAP 贡献增量","域偏移 P(X) 变","概念漂移 P(Y|X) 变"],C.violet);
+  g+=box(xs[2],y,w,h,"⑤ 分级重训",["<1.0 observe 不重训","1.0–3.0 incremental","≥3.0 full 清洗全量"],C.amber);
+  g+=box(xs[3],y,w,h,"⑥ 评估上线",["留出 20% 独立验收","静态锚 +5% 拒","增益 ≥3% 才上线"],C.green);
+  g+=box(xs[4],y,w,h,"⑦ 回滚",["快照回退","闭环的一环","不是终止态"],C.rose);
+  [1,2,3,4].forEach(i=>{g+=arrow(xs[i-1]+w,y+h/2,xs[i],C.dim,"");});
+  // 下层：预算 / 模型
+  g+=box(460,372,170,82,"预算约束",["重训槽位 ≤ "+D.meta.max_retrains,"标注预算 ≤ "+D.meta.budget,"超限即停手"],C.rose);
+  g+=`<line x1="545" y1="372" x2="545" y2="${y+h+12}" stroke="${C.rose}" stroke-width="1.8"/>`
+    +`<path d="M540,${y+h+11} L545,${y+h} L550,${y+h+11}" fill="${C.rose}"/>`
+    +`<text x="555" y="350" fill="${C.rose}" font-size="9.5">约束</text>`;
+  g+=box(670,372,380,82,"预测层（可一键切换，共享全部闸门）",["--model mlp      反应式，通用非线性","--model kalman   线性映射，CV-KF 追踪 w(t)","--model hybrid    MLP 主体 + 残差卡尔曼"],C.cyan);
+  // 回流（矩形闭环，绕开下方卡片）
+  g+=`<path d="M965,${y+h} L965,486 L125,486 L125,${y+h}" fill="none" stroke="${C.rose}" stroke-width="1.4" stroke-dasharray="6 4" opacity=".85"/>`;
+  g+=`<path d="M120,${y+h+9} L125,${y+h} L130,${y+h+9}" fill="none" stroke="${C.rose}" stroke-width="1.4"/>`;
+  g+=`<text x="545" y="505" fill="${C.rose}" font-size="10.5" text-anchor="middle">闭环回流：上线/回滚后继续监测下一批，边跑边适应，不等下一轮离线重训</text>`;
+  $("diagram").innerHTML=`<svg viewBox="0 0 1090 520">${g}</svg>`;
+})();
+
+/* ---------- ① 实验进度 ---------- */
+(function(){
+  const total = D.meta.n_runs_total;
+  const rows=[]; let done=0;
+  Object.entries(D.models).forEach(([m,md])=>{
+    ["sudden","gradual"].forEach(d=>{
+      if(!md[d]) return;
+      md[d].seeds.forEach(s=>{ done++; rows.push({m,d,...s,n:s.n}); });
+    });
+  });
+  const pct=Math.round(done/total*100);
+  $("progAll").style.width=pct+"%";
+  $("progTxt").textContent=`${done}/${total} · ${pct}%`;
+  $("progTag").textContent=`实验完成度 ${pct}%`;
+
+  const chips=[];
+  [["mlp","sudden","突变"],["mlp","gradual","渐变"],["kalman","sudden","突变"],["kalman","gradual","渐变"],["hybrid","sudden","突变"],["hybrid","gradual","渐变"]]
+  .forEach(([m,d,dn])=>{
+    [42,7,2024].forEach(seed=>{
+      const hit=D.models[m][d]?.seeds.find(s=>s.seed===seed);
+      chips.push(`<span class="chip ${hit?'done':''}">${MLABEL[m]} · ${dn} · s${seed}${hit?" ✓":""}</span>`);
+    });
+  });
+  $("progChips").innerHTML=chips.join("");
+
+  const budget=D.meta.budget, maxR=D.meta.max_retrains;
+  const denom=Math.max(...rows.map(r=>r.n));
+  $("progRows").innerHTML=rows.map(r=>{
+    const bp=Math.min(r.n/denom*100,100), lp=Math.min(r.labels/budget*100,100), rp=Math.min(r.retrains/maxR*100,100);
+    const col=MC[r.m];
+    return `<div class="prog">
+      <div class="m">${MLABEL[r.m]} <small>· ${r.d==="sudden"?"突变":"渐变"} · s${r.seed}</small></div>
+      <div><div class="bar"><i style="width:${bp}%;background:${col}"></i></div><div class="num">数据流 ${r.n}/${denom} 批</div></div>
+      <div><div class="bar"><i style="width:${lp}%;background:${C.amber}"></i></div><div class="num">标注 ${r.labels}/${budget}</div></div>
+      <div><div class="bar"><i style="width:${rp}%;background:${C.rose}"></i></div><div class="num">重训 ${r.retrains}/${maxR}</div></div>
+      <div style="text-align:right;color:${col};font-weight:700">${r.tail.toFixed(3)}</div>
+    </div>`;
+  }).join("");
+})();
+
+/* ---------- 通用 SVG ---------- */
+function frame(w,h,ml,mr,mt,mb){const svg=document.createElementNS("http://www.w3.org/2000/svg","svg");
+  svg.setAttribute("viewBox",`0 0 ${w} ${h}`);
+  svg.innerHTML=`<rect x="${ml}" y="${mt}" width="${w-ml-mr}" height="${h-mt-mb}" fill="#0e1626" stroke="${C.line}" rx="6"/>`;
+  return {svg, X:v=>ml+(w-ml-mr)*v, Y:(v0,v1)=>v=>mt+(h-mt-mb)*(1-(v-v0)/(v1-v0||1))};}
+function fmtN(v){return Math.abs(v)>=100?Math.round(v):Math.abs(v)>=1?(+v.toFixed(1)):(+v.toFixed(2));}
+
+/* ---------- ② RMSE ---------- */
+window.rmseMode="sudden";
+window.drawRmse=function(){
+  const mode=window.rmseMode;
+    const w=960,h=330,ml=54,mr=120,mt=16,mb=32;
+    const f=frame(w,h,ml,mr,mt,mb);
+    const keys=["mlp","kalman","hybrid"];
+    const curves=keys.map(k=>D.models[k][mode]).filter(Boolean);
+    const all=curves.flatMap(x=>x.curve);
+    const v1=Math.ceil(Math.max(...all,0.2)*1.12*10)/10, v0=0;
+    const Y=f.Y(v0,v1), X=v=>f.X(v/6000);
+    let inner="";
+    [0,v1/2,v1].forEach(v=>{inner+=`<line x1="${f.X(0)}" x2="${f.X(1)}" y1="${Y(v)}" y2="${Y(v)}" stroke="${C.line}" stroke-dasharray="2 4" opacity=".5"/><text x="${f.X(0)-8}" y="${Y(v)+4}" fill="${C.dim}" font-size="10" text-anchor="end">${fmtN(v)}</text>`;});
+    [0,1500,3000,4500,6000].forEach(b=>{inner+=`<text x="${X(b)}" y="${h-mb+16}" fill="${C.dim}" font-size="10" text-anchor="middle">${b/1000}k</text>`;});
+    // 噪声下限
+    inner+=`<line x1="${f.X(0)}" x2="${f.X(1)}" y1="${Y(0.1)}" y2="${Y(0.1)}" stroke="${C.green}" stroke-dasharray="7 4" opacity=".9"/>`;
+    inner+=`<text x="${f.X(1)-4}" y="${Y(0.1)-6}" fill="${C.green}" font-size="10" text-anchor="end">噪声下限 0.1</text>`;
+    const rep=D.models.mlp[mode].rep;
+    rep.drift_points.forEach(b=>{inner+=`<line x1="${X(b)}" x2="${X(b)}" y1="${Y(v1)}" y2="${Y(v0)}" stroke="${C.rose}" opacity=".55" stroke-dasharray="4 3"/>`;});
+    keys.forEach((k,i)=>{
+      const m=D.models[k][mode]; if(!m) return;
+      const col=MC[k];
+      inner+=`<path d="${m.curve.map((v,j)=>`${j?"L":"M"}${X(j*200)},${Y(v)}`).join("")}" fill="none" stroke="${col}" stroke-width="2.2"/>`;
+      m.rep.retrains.forEach(b=>{const j=Math.round(b/200);const v=m.curve[j]??m.curve[m.curve.length-1];
+        inner+=`<circle cx="${X(j*200)}" cy="${Y(v)}" r="3.8" fill="${col}" stroke="#0e1626" stroke-width="1.2"/>`;});
+      const last=m.curve[m.curve.length-1];
+      inner+=`<text x="${X(6000)+8}" y="${Y(last)+4}" fill="${col}" font-size="11.5" font-weight="700">${last.toFixed(3)}</text>`;
+    });
+    f.svg.innerHTML+=inner; $("chart-rmse").innerHTML=""; $("chart-rmse").appendChild(f.svg);
+    $("legRmse").innerHTML=keys.map(k=>`<s style="background:${MC[k]}"></s>${MLABEL[k]}（末段 ${D.models[k][mode].kpi.tail}）`).join("")
+      +`<s style="background:${C.green}"></s>噪声下限 0.1<u style="background:${C.rose}"></u>真实漂移点<u style="background:${C.amber}"></u>重训动作`;
+    $("f1").textContent=(mode==="sudden"?"突变":"渐变")+" · 3 种子均值曲线";
+    $("btnS").className="btn"+(mode==="sudden"?" on":"");
+    $("btnG").className="btn"+(mode==="gradual"?" on":"");
+  }
+$("btnS").onclick=()=>{window.rmseMode="sudden";window.drawRmse();};
+$("btnG").onclick=()=>{window.rmseMode="gradual";window.drawRmse();};
+window.drawRmse();
+
+/* ---------- ③ 双路监测（MLP 突变代表流） ---------- */
+function dualChart(d, thr, log, color){
+  const w=960,h=230,ml=56,mr=16,mt=12,mb=26;
+  const f=frame(w,h,ml,mr,mt,mb);
+  let v1=Math.max(thr*2,...d.map(x=>Math.abs(x)));
+  v1=log?Math.max(1,Math.log10(v1)*1.1):v1*1.05;
+  const tv=x=>log?Math.log10(Math.max(x,1e-6)):x;
+  const Y=f.Y(Math.min(0,tv(Math.min(...d.map(x=>Math.min(x,thr))))) , v1);
+  const X=i=>f.X(i/Math.max(d.length-1,1));
+  let inner="";
+  [0,v1/2,v1].forEach(v=>{inner+=`<line x1="${f.X(0)}" x2="${f.X(1)}" y1="${Y(v)}" y2="${Y(v)}" stroke="${C.line}" stroke-dasharray="2 4" opacity=".5"/><text x="${f.X(0)-8}" y="${Y(v)+4}" fill="${C.dim}" font-size="10" text-anchor="end">${fmtN(log?Math.pow(10,v):v)}</text>`;});
+  [0,1500,3000,4500,6000].forEach(b=>{inner+=`<text x="${f.X(b/6000)}" y="${h-mb+14}" fill="${C.dim}" font-size="10" text-anchor="middle">${b/1000}k</text>`;});
+  const ty=Y(tv(thr));
+  inner+=`<line x1="${f.X(0)}" x2="${f.X(1)}" y1="${ty}" y2="${ty}" stroke="${C.rose}" stroke-dasharray="6 3"/><text x="${f.X(1)-4}" y="${ty-6}" fill="${C.rose}" font-size="9.5" text-anchor="end">${log?"α=0.05":"z=3.0"}</text>`;
+  const rep=D.models.mlp.sudden.rep;
+  rep.dual.forEach((v,i)=>{if(v) inner+=`<circle cx="${X(i)}" cy="${Y(tv(d[i]))}" r="4.5" fill="${C.amber}" opacity=".9"/>`;});
+  inner+=`<path d="${d.map((v,i)=>`${i?"L":"M"}${X(i).toFixed(1)},${Y(tv(v)).toFixed(1)}`).join("")}" fill="none" stroke="${color}" stroke-width="1.8"/>`;
+  f.svg.innerHTML+=inner; return f.svg;
+}
+window.renderDual = function(){
+  $("chart-mmd").innerHTML="";
+  $("chart-mmd").appendChild(dualChart(D.models.mlp.sudden.rep.mmd_z,3.0,false,C.cyan));
+  $("chart-ks").innerHTML="";
+  $("chart-ks").appendChild(dualChart(D.models.mlp.sudden.rep.ks_p,0.05,true,C.green));
+};
+window.renderDual();
+
+/* ---------- ④ tier 时间线 ---------- */
+window.renderTierline = function(){
+  const rows=D.models.mlp.sudden.rep.tiers, n=rows.length;
+  let cells="";
+  rows.forEach((t,i)=>{cells+=`<rect x="${i/n*100}" y="0" width="${100/n+0.15}" height="100%" fill="${TIER_C[t]||"#2a3650"}" opacity=".9"/>`;});
+  $("chart-tierline").innerHTML=`<svg viewBox="0 0 100 10" preserveAspectRatio="none" style="height:46px;border-radius:8px;overflow:hidden"><g>${cells}</g></svg>
+  <div style="display:flex;justify-content:space-between;color:var(--dim);font-size:10px"><span>0k</span><span>1.5k</span><span>3k</span><span>4.5k</span><span>6k</span></div>`;
+  $("tierleg").innerHTML=Object.keys(TIER_C).map(k=>`<s style="background:${TIER_C[k]}"></s>${k}`).join("");
+};
+window.renderTierline();
+
+/* ---------- ⑤ 三模型对照表 ---------- */
+window.renderModelTable = function(){
+  let html=`<tr><th>模型</th><th>场景</th><th>末段 RMSE</th><th>峰值 RMSE</th><th>重训</th><th>标注</th><th>Δ vs MLP</th></tr>`;
+  ["sudden","gradual"].forEach(d=>{
+    const base=D.models.mlp[d].kpi.tail;
+    Object.entries(D.models).forEach(([k,m])=>{
+      const x=m[d]; if(!x) return;
+      const dd=(x.kpi.tail-base)/base*100;
+      const ds=(dd>=0?"+":"")+dd.toFixed(0)+"%";
+      const hl=(dd<-30)?" class='hl'":"";
+      html+=`<tr${hl}><td>${MLABEL[k]}</td><td>${d==="sudden"?"突变":"渐变"}</td>
+        <td><b>${x.kpi.tail}</b></td><td>${x.kpi.peak}</td><td>${x.kpi.retrains}</td>
+        <td>${x.kpi.labels}</td><td style="color:${dd<0?C.green:C.rose}">${ds}</td></tr>`;
+    });
+  });
+  $("tbl-model").innerHTML=html;
+};
+window.renderModelTable();
+
+/* ---------- ⑥ 三档命中 ---------- */
+(function(){
+  const sc=Object.keys(D.tierAuto); const keys=["observe","incremental","full"];
+  const w=960,h=260,ml=110,mr=16,mt=12,mb=30;
+  const f=frame(w,h,ml,mr,mt,mb);let inner="";
+  const maxV=Math.max(3,...sc.map(k=>Object.values(D.tierAuto[k].tiers).reduce((a,b)=>a+b,0)));
+  const rowH=(h-mt-mb)/sc.length;
+  sc.forEach((k,i)=>{
+    const y=mt+rowH*(i+0.5); let x=0;
+    inner+=`<text x="${ml-10}" y="${y+4}" fill="${C.dim}" font-size="11.5" text-anchor="end">${k}</text>`;
+    keys.forEach(t=>{const v=D.tierAuto[k].tiers[t]; const wpx=(f.X(1)-f.X(0))*v/maxV;
+      inner+=`<rect x="${f.X(0)+x}" y="${y-rowH*0.28}" width="${Math.max(wpx-1.5,0)}" height="${rowH*0.56}" fill="${TIER_C[t]}" rx="3"/>`;
+      if(v>0) inner+=`<text x="${f.X(0)+x+wpx/2}" y="${y+4}" font-size="11" fill="#0b1220" text-anchor="middle" font-weight="700">${v}</text>`;
+      x+=wpx;});
+    inner+=`<text x="${f.X(1)+6}" y="${y+4}" fill="${C.dim}" font-size="10.5">末段 ${D.tierAuto[k].final_mean}</text>`;});
+  f.svg.innerHTML+=inner; $("chart-tierhit").appendChild(f.svg);
+  $("hitleg").innerHTML=keys.map(t=>`<s style="background:${TIER_C[t]}"></s>${t}`).join("");
+})();
+
+/* ---------- ⑦ 动作对照 / 消融 ---------- */
+(function(){
+  if(!D.calibration.length){$("tbl-act").innerHTML="<tr><td>暂无标定数据</td></tr>";}
+  else{
+    const scens=[...new Set(D.calibration.map(r=>r.scenario))];
+    const acts=["observe","incremental","full"];
+    let html=`<tr><th>场景 \\ 动作</th>${acts.map(a=>`<th>${a}</th>`).join("")}<th>结论</th></tr>`;
+    scens.forEach(sc=>{
+      const rs=acts.map(a=>D.calibration.find(r=>r.scenario===sc&&r.action===a)).filter(Boolean);
+      const best=rs.reduce((p,c)=>c.J<p.J?c:p);
+      html+=`<tr><td>${sc}</td>${acts.map(a=>{const r=rs.find(x=>x.action===a);
+        return r?`<td>${r.rmse} / ${r.labels}条${r===best?" ★":""}</td>`:"<td>—</td>";}).join("")}
+        <td style="color:var(--dim)">最优：${best.action}（J=${best.J}）</td></tr>`;});
+    $("tbl-act").innerHTML=html;
+  }
+  const A=D.ablation.rows;
+  if(A.length){
+    let html=`<tr><th>预算</th><th>漂移</th><th>配置</th><th>末段RMSE(均值±std)</th><th>标注</th></tr>`;
+    A.filter(r=>r.config!=="base").forEach(r=>{
+      html+=`<tr><td>${r.budget==="tight"?"紧(3次/1500)":"松(10次/4000)"}</td><td>${r.drift}</td><td>${r.config==="full"?"完整系统":"去归因no2"}</td><td>${r.rmse} ± ${r.rmse_std}</td><td>${r.labels}</td></tr>`;});
+    $("tbl-abl").innerHTML=html;
+  }
+  if(D.innov45.length){
+    let html=`<tr><th>机制评估(innov4/5)</th><th>漂移</th><th>配置</th><th>末段RMSE</th></tr>`;
+    D.innov45.forEach(r=>{html+=`<tr><td>${r.budget}</td><td>${r.drift}</td><td>${{base:"基线",pacing:"仅节流",window:"仅自适应窗口",both:"两者"}[r.config]||r.config}</td><td>${r.rmse}</td></tr>`;});
+    $("tbl-i45").innerHTML=html;
+  }
+
+  // ---- S2 fast_recovery 对照表 ----
+  const frRows = [
+    {s:"突变",m:"off",peak:7.871,tail:0.169,ret:3,lab:1800},
+    {s:"突变",m:"a1",peak:7.871,tail:0.169,ret:3,lab:1800},
+    {s:"突变",m:"a2",peak:7.871,tail:0.169,ret:3,lab:1800},
+    {s:"渐变",m:"off",peak:1.825,tail:1.306,ret:5,lab:2600},
+    {s:"渐变",m:"a1",peak:1.825,tail:1.306,ret:5,lab:2600},
+    {s:"渐变",m:"a2",peak:1.825,tail:1.306,ret:5,lab:2600},
+  ];
+  let frHtml = "<tr><th>场景</th><th>模式</th><th>峰值</th><th>末段</th><th>重训</th><th>标注</th></tr>";
+  frRows.forEach(r=>{ frHtml+=`<tr><td>${r.s}</td><td>${r.m}</td><td>${r.peak.toFixed(3)}</td><td>${r.tail.toFixed(3)}</td><td>${r.ret}</td><td>${r.lab}</td></tr>`; });
+  $("tbl-fr").innerHTML=frHtml;
+
+  // ---- S2.1 HPO 排名表 ----
+  const hpoRows = [
+    {r:1,h:"(64,32)",lr:"0.01",a:"0.001",rmse:0.1556,best:true},
+    {r:2,h:"(32,16)",lr:"0.01",a:"0.001",rmse:0.1578},
+    {r:3,h:"(32,16)",lr:"0.01",a:"0.0001",rmse:0.1585},
+    {r:4,h:"(64,32)",lr:"0.01",a:"0.0001",rmse:0.1602,old:"旧默认"},
+    {r:5,h:"(64,32)",lr:"0.001",a:"0.001",rmse:0.1892},
+    {r:6,h:"(64,32)",lr:"0.001",a:"0.0001",rmse:0.1924},
+    {r:7,h:"(32,16)",lr:"0.001",a:"0.0001",rmse:0.2223},
+    {r:8,h:"(32,16)",lr:"0.001",a:"0.001",rmse:0.2223},
+  ];
+  let hpoHtml = "<tr><th>排名</th><th>隐藏层</th><th>lr</th><th>alpha</th><th>均值 val RMSE</th><th>备注</th></tr>";
+  hpoRows.forEach(r=>{
+    const cls = r.best ? ' class="hl"' : "";
+    const note = r.best ? "★ 最优" : (r.old || "");
+    hpoHtml += `<tr${cls}><td>${r.r}</td><td>${r.h}</td><td>${r.lr}</td><td>${r.a}</td><td>${r.rmse.toFixed(4)}</td><td>${note}</td></tr>`;
+  });
+  $("tbl-hpo").innerHTML=hpoHtml;
+})();
+
+/* ---------- 现场重跑实验 ---------- */
+(function(){
+  const btnGo=$("btnRerunGo"), btnStop=$("btnRerunStop"),
+        statusEl=$("rrStatus"), logEl=$("rrLog"), tagEl=$("rrTag");
+  let pollTimer=null;
+
+  if(location.protocol === "file:"){
+    btnGo.disabled = true;
+    btnGo.style.opacity = "0.5";
+    statusEl.innerHTML = '<span style="color:var(--rose);font-weight:700">⚠ 当前为 file:// 直接打开，无法调用后端。请执行以下步骤启用现场重跑：</span><br>'
+      + '<code style="color:var(--amber);background:#0a0f1c;padding:2px 6px;border-radius:4px">py scripts/serve_console.py</code><br>'
+      + '然后访问 <a href="http://127.0.0.1:8900/dashboard.html" style="color:var(--cyan)">http://127.0.0.1:8900/dashboard.html</a>';
+    tagEl.textContent = "未连接后端"; tagEl.style.color="var(--rose)"; tagEl.style.borderColor="var(--rose)";
+    return;
+  }
+
+  function setRunning(running){
+    btnGo.style.display = running ? "none" : "";
+    btnStop.style.display = running ? "" : "none";
+  }
+
+  btnGo.onclick = async () => {
+    const model=$("rrModel").value, drift=$("rrDrift").value;
+    const body = {source:"synthetic", drift, model, experiment_name:`live-${model}-${drift}`};
+    statusEl.textContent = "启动中…";
+    logEl.style.display="block"; logEl.textContent="";
+    setRunning(true);
+    tagEl.textContent="运行中"; tagEl.style.color="var(--amber)"; tagEl.style.borderColor="var(--amber)";
+    try{
+      const r = await (await fetch("/api/run",{method:"POST",
+        headers:{"Content-Type":"application/json"},body:JSON.stringify(body)})).json();
+      if(!r.ok){ statusEl.textContent=r.msg; setRunning(false); return; }
+      statusEl.textContent = `已启动 ${model}/${drift}，等待完成…`;
+      poll();
+    }catch(e){
+      statusEl.innerHTML = '⚠ 无法连接 serve_console.py。请先在项目根目录运行：<br>'
+        + '<code style="color:var(--amber);background:#0a0f1c;padding:2px 6px;border-radius:4px">py scripts/serve_console.py</code><br>'
+        + '然后通过 <a href="http://127.0.0.1:8900/dashboard.html" style="color:var(--cyan)">http://127.0.0.1:8900/dashboard.html</a> 访问（不要双击打开）';
+      setRunning(false);
+    }
+  };
+
+  btnStop.onclick = async () => {
+    await fetch("/api/stop",{method:"POST"});
+    if(pollTimer){clearInterval(pollTimer); pollTimer=null;}
+    statusEl.textContent="已停止"; setRunning(false);
+    tagEl.textContent="已停止"; tagEl.style.color="var(--rose)"; tagEl.style.borderColor="var(--rose)";
+  };
+
+  function poll(){
+    if(pollTimer) clearInterval(pollTimer);
+    pollTimer = setInterval(async ()=>{
+      try{
+        const s = await (await fetch("/api/status")).json();
+        const lines = (s.log||[]).join("\n");
+        logEl.textContent = lines;
+        logEl.scrollTop = logEl.scrollHeight;
+        if(!s.running && s.rc !== null){
+          clearInterval(pollTimer); pollTimer=null;
+          setRunning(false);
+          if(s.rc === 0 && s.csv){
+            statusEl.textContent = `完成，结果文件：${s.csv}，正在刷新图表…`;
+            const res = await (await fetch("/api/result?f="+encodeURIComponent(s.csv))).json();
+            if(res.error){ statusEl.textContent="解析失败："+res.error; return; }
+            applyResult(res, $("rrModel").value, $("rrDrift").value);
+            tagEl.textContent="已刷新"; tagEl.style.color="var(--green)"; tagEl.style.borderColor="var(--green)";
+          }else{
+            statusEl.textContent = `运行结束（退出码 ${s.rc}）`;
+            tagEl.textContent="失败"; tagEl.style.color="var(--rose)"; tagEl.style.borderColor="var(--rose)";
+          }
+        }
+      }catch(e){}
+    }, 1500);
+  }
+
+  function applyResult(res, model, mode){
+    D.models[model][mode] = {
+      curve: res.rmse,
+      kpi: res.kpi,
+      rep: {
+        mmd_z: res.mmd_z, ks_p: res.ks_p, tiers: res.tiers,
+        dual: res.dual, drift_points: res.drift_points, retrains: res.retrains
+      }
+    };
+    window.rmseMode = mode;
+    window.renderKpis();
+    window.drawRmse();
+    window.renderModelTable();
+    if(model==="mlp" && mode==="sudden"){
+      window.renderDual();
+      window.renderTierline();
+    }
+    statusEl.textContent = `已刷新：${model}/${mode} 末段 RMSE=${res.kpi.tail} 峰值=${res.kpi.peak}（单种子现场结果，KPI/曲线/对照表已同步）`;
+  }
+})();
+</script>
+</body>
+</html>
