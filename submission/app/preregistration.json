@@ -127,6 +127,328 @@
    "hash_of": "content",
    "id": "C4-calibration-2026-11-22.v2",
    "sha256": "1a379d8c20bf728e36751749e29481614d5d651c3390bed6a458298c707321a9"
+  },
+  {
+   "canonical": "json/utf-8/sort_keys/indent=1",
+   "content": {
+    "append_reason": "v2 的权重漂移守卫按 concat_rel_l2(weights, parent) 判。对 C 线的闭式岭头这是失真口径：λ→1e-5 后 w2 范数被放大，rel_l2 达 1.7–3.6，而折外预测并未发散（fold4 预测 max 335 / q95 236，真值 max 542 / q95 279）。结果是 soup 6 个 α 全部不合格，C4 五折 5/5 逐字节退回父权重，能拿到的增益全部被守卫吃掉。本版把 C 的守卫换成预测空间位移，并同步登记 λ 规则、δ/NAS 关停与校准端点。",
+    "appended_before_implementation": true,
+    "changes_vs_v2": {
+     "calibration_C": {
+      "a_bound": 0.05,
+      "a_ema_state": "写钳制后的值",
+      "c_bound": 2.0,
+      "decision_reason": "折外 +0.0403 虽小为正；主要风险已被 c 上界兜住",
+      "strength": "保留现行实现，不降到恒等"
+     },
+     "guard_C": {
+      "cage_site_note": "check_candidate 目前不读数据（docstring：不读数据、不跑平台），拿不到标签，无法在 cage 内计算预测位移。两条落地路径：(a) C 的 cage 只记录 rel_l2 事实、不再据此报错，位移判定前移到 soup（此时载荷只来自 soup 变体或父产物，判定点唯一且带标签）；(b) 给 check_candidate 增加可选 (z_val, y_val, target_mean, target_scale) 参数并让三个调用方传入。推荐 (a)，改动面小。",
+      "from": {
+       "metric": "concat_rel_l2(weights, parent)",
+       "threshold": 0.1,
+       "unit": "weight space"
+      },
+      "no_verifiable_protective_power": true,
+      "not_a_safety_net": true,
+      "role": "displacement_record_and_extreme_interception",
+      "scope": "仅 C 线；A 线维持计划累计步幅预算，B 线维持 rel_l2 0.1",
+      "sites_to_change": [
+       "app/train_mlp.py 的 soup 变体过滤（现 :1034 rel<=cap）",
+       "app/llm_cage.py 的官方检查点第 5b 项（现 :691-704 rel_l2 判定）",
+       "app/train_round.py 的 R10 候选族 _eligible（现 :929-935，仅第 10 轮触发）"
+      ],
+      "threshold_choice": {
+       "rationale": "0.11 比 0.10 好 0.0151（54.2218 vs 54.2369，带校准口径），差异在折间噪声内；0.11 与 0.12 逐位相同，说明 0.11 已越过平台起点，取更宽一档不损失均值，并把 fold3 的边界余量从 0.0011 放大到 0.0051。",
+       "rule": "0.11 与 0.10 的均值差在折间噪声内，取更宽的一档；0.11–0.12 为平台",
+       "sensitivity_5fold_calibrated": [
+        {
+         "disp_min_med_max": [
+          0.06462,
+          0.06589,
+          0.073792
+         ],
+         "mean_rmse": 54.343,
+         "rejected_folds": 0,
+         "selected_alpha": [
+          0.5,
+          0.5,
+          0.5,
+          0.5,
+          0.5
+         ],
+         "threshold": 0.09
+        },
+        {
+         "disp_min_med_max": [
+          0.069822,
+          0.097021,
+          0.099115
+         ],
+         "mean_rmse": 54.2369,
+         "rejected_folds": 0,
+         "selected_alpha": [
+          0.5,
+          0.75,
+          0.75,
+          0.5,
+          0.75
+         ],
+         "threshold": 0.1
+        },
+        {
+         "disp_min_med_max": [
+          0.073792,
+          0.098155,
+          0.1049
+         ],
+         "mean_rmse": 54.2218,
+         "rejected_folds": 0,
+         "selected_alpha": [
+          0.5,
+          0.75,
+          0.75,
+          0.75,
+          0.75
+         ],
+         "threshold": 0.11
+        },
+        {
+         "disp_min_med_max": [
+          0.073792,
+          0.098155,
+          0.1049
+         ],
+         "mean_rmse": 54.2218,
+         "rejected_folds": 0,
+         "selected_alpha": [
+          0.5,
+          0.75,
+          0.75,
+          0.75,
+          0.75
+         ],
+         "threshold": 0.12
+        }
+       ]
+      },
+      "to": {
+       "measurement_slice": "当轮 validation 切片（与选点同一份），未校准预测",
+       "metric": "rms(pred_candidate - pred_parent) / target_scale",
+       "threshold": 0.11,
+       "unit": "target_scale（C 线 84.357748，阈值 0.11 ≈ 9.28 周期 RMS）"
+      },
+      "why_no_protective_power": "C4 五折 30 个候选里 29 个优于父产物；唯一坏变体（fold0 α=1.0，折外 51.350 vs 父 51.133）在 rel_l2 / 预测位移 / 范数比三个度量下都落在好变体取值区间内，AUC(bad>good)=0.167。守卫做不到分辨好坏，只能记录位移并拦极端值。"
+     },
+     "nas_guard_C": {
+      "delta_bias": "随闸门一起关闭；平台 NASA 不计分，δ 只花 RMSE",
+      "from": "on（CONTEST_NAS_GUARD 缺省 1）",
+      "scope": "仅 dataset_key == 'C'",
+      "to": "off（缺省 0）"
+     },
+     "ridge_grid": {
+      "added": [
+       1e-05
+      ],
+      "from": [
+       0.0,
+       1e-06,
+       0.0001,
+       0.001,
+       0.01
+      ],
+      "to": [
+       0.0,
+       1e-06,
+       1e-05,
+       0.0001,
+       0.001,
+       0.01
+      ]
+     },
+     "ridge_tolerance": {
+      "from": 0.015,
+      "rule": "内层验证 argmin（容忍带归零）",
+      "to": 0.0
+     }
+    },
+    "date": "2026-11-22",
+    "discipline": [
+     "L2-SP 触发语义按实现写：d0 > 1.1 × d_target；A 的 d_target=0.15 对应触发点 0.165，保险区是 (0.165, 0.1696] 与越 cap 轮；任何地方不许写“触发点 0.15”。",
+     "不许写“L2-SP 带来提升”：现行工况下期望触发频率≈0，它是保险不是杠杆。",
+     "C 的守卫只写“位移记录 + 极端拦截”，不许写“安全网”“保护力”：5 折 AUC(bad>good)=0.167，无法分辨好坏变体。",
+     "C 的守卫阈值 0.11 由 C4 五折敏感性表定档；引用阈值时必须同时给出 0.10/0.11/0.12 的均值，不许只写 0.11。",
+     "λ 选择规则只写“内层验证 argmin（容忍带归零）”，不许再写“比最优差 1.5% 以内取最大 λ”。",
+     "C4 全部数字是 1 次训练/折、无重复；0.01–0.10 级差异在折间波动内，引用时不许当显著结论。"
+    ],
+    "evidence": {
+     "artifact": "d:\\智能比赛\\2026-11-22\\c-push\\work\\chain_v3.json",
+     "before_change_real_path": {
+      "delta_off": 54.838013,
+      "delta_on": 55.136673
+     },
+     "chain_vs_real_path_gap": "≤0.0001（chain_v3 54.1744 vs c4_ruler 54.174358）",
+     "discrimination": {
+      "auc_bad_over_good": 0.167,
+      "conclusion": "三个候选度量排序一致，均无法区分好坏变体"
+     },
+     "headroom_warning": "fold3 的入选位移 0.104900，距阈值 0.11 余量 0.0051；其余折 0.006–0.036。若线上切片位移更高，退到 α=0.5（位移约 0.07）而不是直接退回父产物。",
+     "new_guard_pred_0.11_no_calib": {
+      "mean_rmse": 54.174358,
+      "parent_kept_folds": 0,
+      "per_fold": [
+       50.876001,
+       57.63223,
+       54.976977,
+       51.413652,
+       55.972932
+      ],
+      "source": "tools/c4_ruler.py --soup（真实 app 路径）"
+     },
+     "new_guard_pred_0.11_with_calib": {
+      "mean_rmse": 54.2218,
+      "source": "work/chain_v3.py（同折目录，校准 EMA 复算）"
+     },
+     "old_guard_rel_0.1": {
+      "eligible_alpha": 0,
+      "mean_rmse": 54.931342,
+      "parent_kept_folds": 5,
+      "per_fold": [
+       51.132858,
+       58.304604,
+       56.073862,
+       52.121601,
+       57.023783
+      ]
+     },
+     "protocol": "每折训练 3 折，内层验证=相邻一折（只选 λ/α/校准），折外只测量",
+     "pure_ridge_head_soup_off": 54.260085,
+     "repeats": "每格 1 次闭式训练，无重复；5 折均值是 5 个折外读数的算术平均",
+     "selected_per_fold": [
+      {
+       "alpha": 0.5,
+       "fold": 0,
+       "pred_disp": 0.073792,
+       "rel_l2": 1.72814
+      },
+      {
+       "alpha": 0.75,
+       "fold": 1,
+       "pred_disp": 0.097021,
+       "rel_l2": 2.585362
+      },
+      {
+       "alpha": 0.75,
+       "fold": 2,
+       "pred_disp": 0.099115,
+       "rel_l2": 2.349876
+      },
+      {
+       "alpha": 0.75,
+       "fold": 3,
+       "pred_disp": 0.1049,
+       "rel_l2": 2.703708
+      },
+      {
+       "alpha": 0.75,
+       "fold": 4,
+       "pred_disp": 0.098155,
+       "rel_l2": 2.390399
+      }
+     ],
+     "split": "C4 五折（seed=c4-2026-11-22，496 台按 (source_subset, unit) 分组，折 77/105/104/94/116 台，行 16420/24379/24354/21331/26605）",
+     "threshold_sweep_no_calib": [
+      {
+       "mean_rmse": 54.297913,
+       "threshold": 0.075
+      },
+      {
+       "mean_rmse": 54.297913,
+       "threshold": 0.09
+      },
+      {
+       "mean_rmse": 54.189668,
+       "threshold": 0.1
+      },
+      {
+       "mean_rmse": 54.174358,
+       "threshold": 0.11
+      },
+      {
+       "mean_rmse": 54.174358,
+       "threshold": 0.12
+      },
+      {
+       "mean_rmse": 54.199432,
+       "threshold": 0.15
+      }
+     ]
+    },
+    "folds": {
+     "assignment": {
+      "reproducible": "同一种子 + 同一 unit 集合 → 同一映射；不需要另存映射表",
+      "rule": "fold = int(sha256(seed + '|' + source_subset + '|' + unit).hexdigest()[:8], 16) % 5",
+      "seed": "c4-2026-11-22",
+      "shared_across_arms": true,
+      "unit_identity": "官方训练集里 (source_subset, unit) 的原始字符串，不做大小写或空白归一化"
+     },
+     "group_by": [
+      "source_subset",
+      "unit"
+     ],
+     "k": 5,
+     "n_units": 496,
+     "shared_across_arms": true,
+     "unit_overlap_between_folds": false,
+     "units_per_fold_approx": 99
+    },
+    "id": "C4-calibration-2026-11-22.v3",
+    "limits": {
+     "covers": [
+      "unseen_unit"
+     ],
+     "cross_line_use": "凡用 C4 预测 A 线行为，须先由第一次真实运行校准",
+     "does_not_cover": [
+      "running_slice"
+     ],
+     "threshold_provenance": "C 的守卫阈值 0.11 是在 C4 五折敏感性表（0.09/0.10/0.11/0.12）上选的：0.11 与 0.10 差 0.0151 在折间噪声内、0.11–0.12 平台，按'同等取更宽一档'定 0.11；没有第二组数据复核，引用时必须带这句。"
+    },
+    "line_b": {
+     "folds": 9,
+     "groups": 9,
+     "scheme": "leave_one_bearing_out",
+     "shared_across_arms": true
+    },
+    "no_fold_results_seen": false,
+    "official_validation": {
+     "disjoint_from_training_folds": true,
+     "not_in_selection": true,
+     "role": "final_adjudication_only",
+     "units": 106
+    },
+    "purpose": "留一机组交叉验证的尺子规格（先定死判据，再看结果）",
+    "scope": "unseen_unit_only",
+    "selection": {
+     "official_validation_in_selection": false,
+     "statistic": "in_fold_mean"
+    },
+    "statistics": {
+     "metric_scope": "各线官方主指标，固定不随轮次更换",
+     "metrics": {
+      "A": "macro_f1",
+      "B": "rmse",
+      "C": "rmse"
+     },
+     "note": "B 线 9 折每折只有 1 台 bearing，单折分数方差极大：任何单折都不得单独用于选择，只有 9 折均值合法；C 线每折约 99 台，同一句话一并适用。",
+     "selection_statistic": "fold_mean",
+     "single_fold_selection_forbidden": true
+    },
+    "supersedes": "C4-calibration-2026-11-22.v2"
+   },
+   "date": "2026-11-22",
+   "hash_of": "content",
+   "id": "C4-calibration-2026-11-22.v3",
+   "sha256": "1735103a58da8ef83dc6a9a68e37cadc1af4d49edf3c498d5e620b9bbf4e5005",
+   "status": "pending_activation"
   }
  ],
  "schema": "contest.v7.preregistration"
