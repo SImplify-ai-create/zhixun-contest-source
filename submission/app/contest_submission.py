@@ -61,6 +61,8 @@ TASKS = ("classification", "regression")
 # task/paths/classes/target_mean/target_scale。v2 自有格式是 task+coef(+classes)。
 OFFICIAL_KEYS = ("w1", "b1", "w2", "b2", "mean", "scale")
 OFFICIAL_FORBIDDEN = {"truerul", "normalizedrul", "remainingusefullife", "rul", "totalsnapshots"}
+# per_cond_seq 的分组字段（与 train_stage 的 GROUP_KEYS 一致）：工况/设置，不是数据集键。
+CONDITION_KEYS = ("settings", "condition", "conditions", "group")
 
 # 输入特征的量级闸门。官方前向会先做 (x-mean)/scale 再 clip 到 ±10σ，1e30 这类
 # 越界值会被 clip 无声吞掉、照常出分；因此必须在 clip 之前判越界，走声明默认。
@@ -247,7 +249,13 @@ def _flatten_official(inputs, expected_paths=None):
         elif isinstance(value, bool):
             raise ContractError("inputs 只接受有限数值，bool 不算数值")
         elif isinstance(value, (int, float)):
-            number = float(value)
+            try:
+                number = float(value)
+            except OverflowError:
+                # 例如 309 位整数字面量：int 本身合法，但超出双精度可表示范围。
+                # 必须转成 ContractError，否则它会绕过逐行兜底让整批 predict 作废。
+                raise ContractError("inputs 数值超出 float 可表示范围（长度 %d 位）"
+                                    % len(str(value)))
             if not math.isfinite(number):
                 raise ContractError("inputs 含非有限数值")
             if abs(number) >= FEATURE_ABS_LIMIT:
@@ -265,6 +273,33 @@ def _flatten_official(inputs, expected_paths=None):
         raise ContractError("inputs 的特征路径与检查点 metadata.paths 不一致（%d vs %d 项）"
                             % (len(paths), len(expected_paths)))
     return np.asarray(values, dtype=float)
+
+
+def _majority_class(classes):
+    """从当轮 `train.jsonl` 的答案计数取实际多数类（并列按字典序取第一个）。
+
+    读不到就返回 None，由调用方标注回退到 `classes[0]`——兜底先验必须真的是
+    "多数类"，不能把列序第一个硬说成多数类。
+    """
+    base = os.environ.get("CONTEST_DATA_DIR") or "/data"
+    path = os.path.join(base, "train.jsonl")
+    wanted = set(classes)
+    counts = {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                answer = row.get("answer") if isinstance(row, dict) else None
+                if isinstance(answer, str) and answer in wanted:
+                    counts[answer] = counts.get(answer, 0) + 1
+    except (OSError, ValueError):
+        return None
+    if not counts:
+        return None
+    best = max(counts.values())
+    return sorted(name for name, count in counts.items() if count == best)[0]
 
 
 def _load_official(archive, key):
@@ -327,7 +362,14 @@ def _load_official(archive, key):
             classes_source = "train.jsonl.sorted"
         if len(set(classes)) != len(classes):
             raise ContractError("官方 classes 有重复：%r" % (classes,))
-        prior_class = classes[0]
+        declared_prior = meta.get("prior_majority_class")
+        if isinstance(declared_prior, str) and declared_prior in classes:
+            prior_class = declared_prior
+        else:
+            prior_class = _majority_class(classes)
+            if prior_class is None:
+                _note("无法从 train.jsonl 确定先验多数类，兜底将使用 classes[0]=%r"
+                      % classes[0])
     else:
         if int(w2.shape[1]) != 1:
             raise ContractError("官方回归 w2 输出维应为 1，实际 %d" % int(w2.shape[1]))
@@ -337,6 +379,24 @@ def _load_official(archive, key):
     if task == "regression" and (not math.isfinite(target_mean)
                                 or not math.isfinite(target_scale) or target_scale == 0.0):
         raise ContractError("官方回归 target_mean/target_scale 非法")
+
+    # v6 输出侧仿射校准：pred' = a·pred + c。它是独立的 metadata 字段，
+    # 不动 target_mean/target_scale（冻结项）。缺省即恒等校准。
+    calibration = meta.get("calibration")
+    if calibration is not None:
+        if not isinstance(calibration, dict):
+            raise ContractError("官方 metadata.calibration 必须是 JSON 对象")
+        if task != "regression":
+            raise ContractError("官方 metadata.calibration 只用于回归产物")
+        try:
+            cal_a = float(calibration.get("a", 1.0))
+            cal_c = float(calibration.get("c", 0.0))
+        except (TypeError, ValueError):
+            raise ContractError("官方 metadata.calibration 的 a/c 不是数值")
+        if not math.isfinite(cal_a) or not math.isfinite(cal_c) or cal_a <= 0.0:
+            raise ContractError("官方 metadata.calibration 非法：a=%r c=%r"
+                                % (cal_a, cal_c))
+        calibration = {"a": cal_a, "c": cal_c}
 
     # 官方 predict 逐行要求 flatten 出来的路径串与 metadata.paths 完全相同。
     paths = meta.get("paths")
@@ -361,6 +421,7 @@ def _load_official(archive, key):
         "scale": np.ascontiguousarray(scale, dtype=float),
         "target_mean": target_mean,
         "target_scale": target_scale,
+        "calibration": calibration,
         "hidden": int(w1.shape[1]),
         "paths": paths,
     }
@@ -376,13 +437,15 @@ def _load_official(archive, key):
 
 def _load_head(model_dir):
     """按 CONTEST_ARTIFACT_PATH 装载检查点，进程内只装一次。"""
-    key = os.path.abspath(model_dir or "/model")
-    if key in _CACHE:
-        return _CACHE[key]
-
     import numpy as np
 
     path = _artifact_path()
+    # 缓存键必须带产物路径：同一进程里换了候选（CONTEST_ARTIFACT_PATH 变化）却
+    # 沿用旧 head，会用上一份权重给新产物出分。
+    key = "%s|%s" % (os.path.abspath(model_dir or "/model"), path)
+    if key in _CACHE:
+        return _CACHE[key]
+
     try:
         archive = np.load(path, allow_pickle=False)
     except Exception as exc:
@@ -505,6 +568,9 @@ def _vector(inputs, head):
             val = float(raw)
         except (TypeError, ValueError):
             raise ContractError("特征 %r 不是数值：%r" % (name, raw))
+        except OverflowError:
+            raise ContractError("特征 %r 超出 float 可表示范围（长度 %d 位）"
+                                % (name, len(str(raw))))
         if not math.isfinite(val):
             raise ContractError("特征 %r 不是有限值：%r" % (name, raw))
         if abs(val) >= FEATURE_ABS_LIMIT:
@@ -593,6 +659,24 @@ def _declared_default(head):
     return {"value": max(0.0, float(prior))}
 
 
+def _condition_of(sample):
+    """per_cond_seq 的分组键：取行的工况/设置字段。
+
+    `dataset_key`（A/B/C）在一批里恒定，拿它分组等于把整批当一组，
+    per_cond_seq 就退化成全批顺序归一化，与"逐条件"的语义不符。
+    工况字段优先取行 inputs，其次取平台上下文；都没有才返回 None（整批一组）。
+    """
+    for holder in (sample.inputs, sample.context):
+        if isinstance(holder, dict):
+            for name in CONDITION_KEYS:
+                if name in holder:
+                    value = holder[name]
+                    if isinstance(value, (dict, list)):
+                        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+                    return value
+    return None
+
+
 def _resolve_task(sample, head):
     """task 优先级：上下文 > 行 > 产物。
 
@@ -631,6 +715,9 @@ def _infer_official(head, sample):
 
     if head.task == "regression":
         value = float(output[0]) * official["target_scale"] + official["target_mean"]
+        calibration = official.get("calibration")
+        if calibration:
+            value = calibration["a"] * value + calibration["c"]
         if not math.isfinite(value):
             raise ContractError("回归输出非有限：%r" % value)
         return {"value": max(0.0, value)}, None
@@ -663,7 +750,7 @@ def _infer(head, sample, state):
                             % (vector.size, head.n_features))
 
     try:
-        vector, pending = head.act["step"](vector, state, sample.dataset_key)
+        vector, pending = head.act["step"](vector, state, _condition_of(sample))
     except actions.ActionError as exc:
         raise ContractError("动作 %s 失败：%s" % (head.action, exc))
 

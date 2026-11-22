@@ -39,6 +39,19 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 import train_stage  # noqa: E402  复用 JSONL 读取与路径展开口径
+from v6alpha import alpha_lib as _alpha_lib  # noqa: E402  v6 纯函数库（原样复用）
+from v6alpha import l2sp as _l2sp  # noqa: E402
+
+# v7 J4：L2-SP 的 d_target 预登记入口与时间保留量。
+# d_target 未登记时锚定关闭，但 trace 照打（dry-run），供挑选可行区间。
+ENV_L2SP_D_TARGET = "CONTEST_L2SP_D_TARGET"
+# v7 预登记（2026-11-22 定案）：A=0.15（平台回执最坏一步 0.1332 < 0.15 < cap 0.1696）；
+# B、C 不登记，按臂配置，不设全局值。
+# 触发语义按实现：d0 > 1.1 × d_target（l2sp.TRIGGER_TOL=0.1）→ A 的触发点是 0.165，
+# 保险区 (0.165, 0.1696] 与越 cap 轮；口径与 C4 尺子预登记见 app/preregistration.json。
+L2SP_D_TARGET_PREREGISTERED = {"A": 0.15}
+L2SP_RESERVE_SECONDS = 5.0
+L2SP_WOULD_BE_RATIOS = (0.5, 0.7, 0.9)
 
 OFFICIAL_KEYS = ("w1", "b1", "w2", "b2", "mean", "scale")
 TRAIN_NAME = "train.jsonl"
@@ -53,6 +66,25 @@ ARM_PROFILES = {
     "B": {"scope": "all", "lr_multiplier": 0.5, "epochs": 2},
     "C": {"scope": "head", "lr_multiplier": 1.0, "epochs": 1},
 }
+# --- 2026-11-21 v5：后段轮次步幅衰减表 ---
+# 目标：后段每轮候选相对父产物的 rel_l2 收进 0.05–0.1，每轮都过 0.1 闸门、每轮都
+# 产出一个可比较的真候选。0.1 阈值不动（放宽要等被拒候选复评结论）。
+# 表项 = (首轮, 末轮, epochs, lr_multiplier)；lr_multiplier 是相对父产物 learning_rate
+# 的绝对倍数（即覆盖 ARM_PROFILES 的值）。区间未覆盖的轮次沿用臂 profile。
+# 实测（A 线公开切片，train_mlp 直接续训父产物，rel_l2 为提交权重 vs 父）：
+#   lr×1.0 → 0.0160；×0.75 → 0.0125；×0.5 → 0.0087；×0.1 → 0.0061。
+#   epochs 在 A 上不改变端点（best_epoch 恒为 1），所以衰减主轴是 lr，epochs 只兜底。
+# C 线是头重解闭式（岭回归），lr/epochs 都不参与求解（实测 6 组设置逐位相同，
+# 提交 rel_l2 恒为 0.0654、soup α=0.25），所以 C 表是恒等项，实际步幅由 soup 的
+# α 在 0.1 闸门内选，不再重复加一层衰减。
+STEP_DECAY = {
+    "A": ((1, 2, 3, 1.0), (3, 4, 2, 0.5), (5, 6, 2, 0.35),
+          (7, 8, 1, 0.35), (9, 99, 1, 0.25)),
+    "B": ((1, 2, 2, 0.5), (3, 4, 2, 0.35), (5, 6, 1, 0.35),
+          (7, 8, 1, 0.25), (9, 99, 1, 0.15)),
+    "C": ((1, 99, 1, 1.0),),
+}
+
 DEFAULTS = {
     "patience": 1,
     "grad_clip": 5.0,
@@ -69,11 +101,19 @@ ENV_EPOCHS = "CONTEST_TRAIN_EPOCHS"
 ENV_NO_GUARD = "CONTEST_TRAIN_KEEP_PARENT"
 # 岭回归选系数的容忍带：比验证最优差 1.5% 以内时取最大的 λ（最小权重范数）。
 RIDGE_TOLERANCE = 0.015
+# 固定标尺的最低有效行占比。低于此值说明切片大面积丢行（结构/标签不匹配），
+# 此时任何两参数拟合都只是"有解"，不是"可评"，宁可让本轮退回父产物。
+MIN_VALID_RATIO = 0.5
 
 # --- 2026-11-20 加固：权重漂移上限 / soup 插值 / C 线 NAS 闸门与 δ 偏置 ---
 # 权重相对父产物的拼接 L2 上限。check_candidate 与 soup 共用同一口径，两处必须同源。
 ENV_REL_CAP = "CONTEST_WEIGHT_REL_CAP"
 REL_CAP_DEFAULT = 0.1
+# A 线的上限不再用单轮常数，而是"计划累计步幅预算"：把 STEP_DECAY 每轮的
+# epochs × lr_multiplier 加起来，乘单轮实测锚点。锚点取 A 线公开切片上
+# lr×1.0、best_epoch=1 的提交 rel_l2=0.0160（见 STEP_DECAY 注释）。
+STEP_ANCHOR_REL_L2 = 0.0160
+PLAN_ROUNDS = 10
 # soup：提交权重 = 父 + α·(训练结果 − 父)。α 在验证集上选，且必须过 REL_CAP。
 # 依据：三线实测迁移率与更新幅度单调反向（A 1.6% 最好，C 岭头 80.6% 为负）。
 ENV_SOUP = "CONTEST_SOUP"
@@ -121,7 +161,10 @@ def _collect(value, out):
     elif isinstance(value, bool):
         raise ValueError("bool 不算数值")
     else:
-        number = float(value)
+        try:
+            number = float(value)
+        except OverflowError:
+            raise ValueError("数值超出 float 可表示范围")
         if not math.isfinite(number):
             raise ValueError("非有限数值")
         out.append(number)
@@ -162,7 +205,7 @@ def _extract(rows, shape, n_features, label_fn):
                 continue
             values = []
             _collect(inputs, values)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             stats["bad_value"] += 1
             continue
         if len(values) != n_features:
@@ -304,12 +347,26 @@ def _loss_grad(z, y, w1, b1, w2, b2, task):
 
 def _predict(z, w1, b1, w2, b2, task, target_mean, target_scale):
     """与 predict 官方前向完全同口径，返回标签下标或原始单位数值。"""
+    return _predict_calibrated(z, w1, b1, w2, b2, task, target_mean, target_scale,
+                               None)
+
+
+def _predict_calibrated(z, w1, b1, w2, b2, task, target_mean, target_scale,
+                        calibration=None):
+    """官方前向 + 可选的输出侧仿射校准 pred' = a·pred + c。
+
+    顺序与 `contest_submission._infer_official` 严格一致：先还原到原始单位，
+    再仿射，最后截断到非负。calibration=None 时逐位等于旧 `_predict`。
+    """
     import numpy as np
 
     _, out = _forward(z, w1, b1, w2, b2)
     if task == "classification":
         return out.argmax(axis=1)
-    return np.maximum(0.0, out[:, 0] * target_scale + target_mean)
+    value = out[:, 0] * target_scale + target_mean
+    if calibration is not None:
+        value = float(calibration[0]) * value + float(calibration[1])
+    return np.maximum(0.0, value)
 
 
 def _macro_f1(y_true, y_pred, n_classes):
@@ -338,18 +395,22 @@ def _metric(task, z_val, y_val, weights, target_mean, target_scale):
 
 
 def nasa_score(y_true, y_pred):
-    """NASA 非对称评分（C-MAPSS 口径）。
+    """NASA 非对称评分（C-MAPSS 口径，v5.1 截断 + 均值）。
 
-    d = 预测 − 真实；d≥0（高估剩余寿命）取 exp(d/10)−1，d<0 取 exp(−d/13)−1，
-    逐样本求和。公式与常数已对平台回执锚定：父权重在 C 包 validation.jsonl 上
-    本地复算 = 5,823,439,325.34，与回执显示值恰差 10³（转录错位，见研判第四份）。
-    逐样本求和 ⇒ 跨样本集（公开 23,049 / 隐藏 9,687）不可直接横比（TASK.md:23）。
+    d = min(预测,125) − min(真实,125)；d≥0（高估剩余寿命）取 exp(d/10)−1，
+    d<0 取 exp(−d/13)−1，逐样本**取均值**（旧版是逐样本求和）。
+    截断 125 针对标签量程：C 标签到 434、B 到 1514，未截断时单行残差会主导指数惩罚。
+    公式与常数已对平台回执锚定：父权重在 C 包 validation.jsonl 上本地复算（求和的旧口径）
+    = 5,823,439,325.34，与回执显示值恰差 10³（转录错位，见研判第四份）。
+    改成均值后跨样本集可直接横比（旧版求和口径下不可比）。
     """
     import numpy as np
 
-    d = np.asarray(y_pred, dtype=float) - np.asarray(y_true, dtype=float)
-    return float(np.sum(np.where(d >= 0.0, np.exp(d / 10.0) - 1.0,
-                                 np.exp(-d / 13.0) - 1.0)))
+    true = np.minimum(np.asarray(y_true, dtype=float), 125.0)
+    pred = np.minimum(np.asarray(y_pred, dtype=float), 125.0)
+    d = pred - true
+    return float(np.mean(np.where(d >= 0.0, np.exp(d / 10.0) - 1.0,
+                                  np.exp(-d / 13.0) - 1.0)))
 
 
 def concat_rel_l2(current, parent_arrays):
@@ -367,10 +428,38 @@ def concat_rel_l2(current, parent_arrays):
     return math.sqrt(num) / math.sqrt(den)
 
 
-def weight_rel_cap():
-    """权重拼接 rel_l2 上限：默认 0.1，CONTEST_WEIGHT_REL_CAP 覆盖。"""
+def planned_cumulative_rel_budget(arm="A", rounds=PLAN_ROUNDS,
+                                  anchor=STEP_ANCHOR_REL_L2):
+    """计划累计步幅预算：Σ(每轮 epochs × lr_multiplier) × 单轮实测锚点。
+
+    衰减表 STEP_DECAY 规定每轮跑几个 epoch、lr 乘多少；锚点是该臂在公开切片上
+    lr×1.0、best_epoch=1 时实测的提交权重 rel_l2。A 线十轮：
+        2×3×1.0 + 2×2×0.5 + 2×2×0.35 + 2×1×0.35 + 2×1×0.25 = 10.6
+        10.6 × 0.0160 = 0.1696
+    闸门按这个上限判，覆盖计划内的全部轮次；不写死 0.15，也不对权重做 clamp。
+    """
+    profile = ARM_PROFILES.get(arm) or ARM_PROFILES["A"]
+    total = 0.0
+    for index in range(1, int(rounds) + 1):
+        plan = step_plan(arm, index) or {
+            "epochs": int(profile["epochs"]),
+            "lr_multiplier": float(profile["lr_multiplier"]),
+        }
+        total += (float(anchor) * float(plan["lr_multiplier"])
+                  * float(plan["epochs"]))
+    return total
+
+
+def weight_rel_cap(arm=None):
+    """权重拼接 rel_l2 上限。
+
+    优先级：CONTEST_WEIGHT_REL_CAP > A 线的计划累计步幅预算 > 0.1。
+    A 线按 STEP_DECAY 求和（0.1696@10 轮），其余线维持单轮口径 0.1。
+    """
     raw = os.environ.get(ENV_REL_CAP)
     if raw is None or not str(raw).strip():
+        if str(arm or "").strip().upper() == "A":
+            return planned_cumulative_rel_budget("A")
         return REL_CAP_DEFAULT
     try:
         value = float(raw)
@@ -420,11 +509,25 @@ def load_yardstick(data_dir, reference_path):
             answer = row.get("answer")
             if isinstance(answer, bool) or not isinstance(answer, (int, float)):
                 return None
-            value = float(answer)
+            try:
+                value = float(answer)
+            except OverflowError:
+                return None
             return value if math.isfinite(value) else None
-    x_val, y_val, _stats = _extract(rows, shape, n_features, label_fn)
+    x_val, y_val, v_stats = _extract(rows, shape, n_features, label_fn)
     if x_val.shape[0] < 1:
         raise TrainMlpError("固定标尺为空：验证集没有可用行")
+    ratio = float(x_val.shape[0]) / float(max(1, len(rows)))
+    _log("标尺有效行 %d/%d（%.1f%%）：bad_shape=%d bad_label=%d bad_value=%d"
+         % (x_val.shape[0], len(rows), ratio * 100.0,
+            v_stats["bad_shape"], v_stats["bad_label"], v_stats["bad_value"]))
+    if ratio < MIN_VALID_RATIO:
+        # 标尺丢行是静默的：两参数仿射只要 2 个点就能"拟合成功"，
+        # 所以必须在比例过低时直接判本轮不可评，而不是让选型基于残破切片。
+        raise TrainMlpError("固定标尺有效行比例 %.1f%% < %.0f%%（%d/%d）："
+                            "丢行过多，拒绝在此标尺上评分"
+                            % (ratio * 100.0, MIN_VALID_RATIO * 100.0,
+                               x_val.shape[0], len(rows)))
     mean = np.asarray(ref["arrays"]["mean"], dtype=float).reshape(-1)
     scale = np.asarray(ref["arrays"]["scale"], dtype=float).reshape(-1)
     z_val = np.clip((x_val - mean) / scale, -10.0, 10.0)
@@ -433,25 +536,55 @@ def load_yardstick(data_dir, reference_path):
     return z_val, np.asarray(y_val, dtype=float), task
 
 
-def score_checkpoint(path, z_val, y_val):
+def _calibration_of(meta, task):
+    """读产物 metadata 里的输出侧仿射校准，校验口径与 predict 侧一致。
+
+    返回 (a, c) 或 None（恒等）。非法直接报错，不静默降级：否则选型会在一个
+    平台装载期就会拒绝的产物上打分。
+    """
+    raw = meta.get("calibration")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise TrainMlpError("metadata.calibration 必须是 JSON 对象")
+    if task != "regression":
+        raise TrainMlpError("metadata.calibration 只用于回归产物")
+    try:
+        a_value = float(raw.get("a", 1.0))
+        c_value = float(raw.get("c", 0.0))
+    except (TypeError, ValueError):
+        raise TrainMlpError("metadata.calibration 的 a/c 不是数值")
+    if not math.isfinite(a_value) or not math.isfinite(c_value) or a_value <= 0.0:
+        raise TrainMlpError("metadata.calibration 非法：a=%r c=%r" % (a_value, c_value))
+    return (a_value, c_value)
+
+
+def score_checkpoint(path, z_val, y_val, calibrated=True):
     """在固定标尺上给单个官方格式检查点打分（不回传预测，只回标量）。
 
     分类：{"task", "macro_f1"}；回归：{"task", "rmse", "nas"}。nas 一并算出，
     是否使用由调用方按 dataset_key 决定（TASK.md：NAS 是 C 的辅助指标）。
+
+    `calibrated=False` 走统一未校准口径（v7 J5 的 `scores_raw` 诊断列，05 号文档）：
+    决策列按提交口径（带 calibration 的带、不带的不带），诊断列只看权重本身。
     """
     import numpy as np
 
     ref = _load_parent(path)
     arrays = ref["arrays"]
     meta = ref["meta"]
-    pred = _predict(z_val,
-                    np.asarray(arrays["w1"], dtype=float),
-                    np.asarray(arrays["b1"], dtype=float),
-                    np.asarray(arrays["w2"], dtype=float),
-                    np.asarray(arrays["b2"], dtype=float),
-                    ref["task"],
-                    float(meta.get("target_mean", 0.0) or 0.0),
-                    float(meta.get("target_scale", 1.0) or 1.0))
+    # 与 predict 同口径：产物自带的输出侧校准必须一起应用，否则"校准带来的增益"
+    # 在选型里完全不可见（选出来的 best 不是平台实际会用的那个）。
+    pred = _predict_calibrated(z_val,
+                               np.asarray(arrays["w1"], dtype=float),
+                               np.asarray(arrays["b1"], dtype=float),
+                               np.asarray(arrays["w2"], dtype=float),
+                               np.asarray(arrays["b2"], dtype=float),
+                               ref["task"],
+                               float(meta.get("target_mean", 0.0) or 0.0),
+                               float(meta.get("target_scale", 1.0) or 1.0),
+                               calibration=(_calibration_of(meta, ref["task"])
+                                            if calibrated else None))
     if ref["task"] == "classification":
         return {"task": "classification",
                 "macro_f1": _macro_f1(y_val, pred, int(np.asarray(arrays["w2"]).shape[1]))}
@@ -463,10 +596,15 @@ def score_checkpoint(path, z_val, y_val):
 
 
 def _load_moments(arrays, w):
-    """从父产物读 Adam 一阶/二阶矩；缺失或形状不符时按零初始化。"""
+    """从父产物读 Adam 一阶/二阶矩；缺失或形状不符时按零初始化。
+
+    返回 `(moments, fresh)`：`fresh` 是缺失/形状不符、按零初始化（fresh Adam）
+    的张量名清单。训练行为不因本清单改变，它只是把"静默清零"变成可对账的账本项。
+    """
     import numpy as np
 
     out = {}
+    fresh = []
     for name in ("w1", "b1", "w2", "b2"):
         first = arrays.get("adam_first_%s" % name)
         second = arrays.get("adam_second_%s" % name)
@@ -476,21 +614,31 @@ def _load_moments(arrays, w):
                          np.asarray(second, dtype=float).copy()]
         else:
             out[name] = [np.zeros_like(w[name]), np.zeros_like(w[name])]
-    return out
+            fresh.append(name)
+    return out, fresh
 
 
 def _adam(epochs, lr, grad_clip, parent, task, z, y, w, batch, seed,
           parent_epochs, parent_steps, patience, z_val, y_val,
-          target_mean, target_scale, deadline, trainable=("w1", "b1", "w2", "b2")):
-    """全参数 Adam。返回 (最优轮权重, 末轮权重, history, 轮数, 步数, 最优指标, 最优轮, 末态矩)。
+          target_mean, target_scale, deadline, trainable=("w1", "b1", "w2", "b2"),
+          l2sp=None):
+    """全参数 Adam。返回 (最优轮权重, 末轮权重, history, 轮数, 步数, 最优指标, 最优轮, 末态矩, fresh)。
 
     Adam 状态与轮次种子都从父产物续上（与官方 model.fit 的续训口径一致）：
     偏差校正从 `metadata.steps` 继续，洗牌种子用 `[seed, metadata.epochs + epoch]`。
+    父产物缺矩（例如插值产物，metadata 声明 `fresh_adam_on_missing_state`）时按零
+    初始化，`fresh` 列出这些张量名供账本对账。
+
+    `l2sp={"lam","start"}` 时给损失加 `(λ/2)‖W−W_start‖²`（λ=0 与不传等价）。
     """
     import numpy as np
 
     beta1, beta2, eps = DEFAULTS["beta1"], DEFAULTS["beta2"], DEFAULTS["adam_eps"]
-    moments = _load_moments(parent, w)
+    moments, fresh = _load_moments(parent, w)
+    penalty_lam = float((l2sp or {}).get("lam") or 0.0)
+    penalty_start = (l2sp or {}).get("start")
+    if penalty_lam > 0.0 and not isinstance(penalty_start, dict):
+        raise TrainMlpError("L2-SP 打开时缺 start 权重（锚点）")
     step = parent_steps
     history = []
     best = {name: w[name].copy() for name in ("w1", "b1", "w2", "b2")}
@@ -512,8 +660,17 @@ def _adam(epochs, lr, grad_clip, parent, task, z, y, w, batch, seed,
             yb = y[index]
             loss, gw1, gb1, gw2, gb2 = _loss_grad(zb, yb, w["w1"], w["b1"],
                                                   w["w2"], w["b2"], task)
-            total += loss * len(index)
             grads = {"w1": gw1, "b1": gb1, "w2": gw2, "b2": gb2}
+            if penalty_lam > 0.0:
+                # 软近端：损失加 (λ/2)‖W−W_start‖²，梯度加 λ(W−W_start)。
+                # λ=0 时两者恒为零，与不传 l2sp 逐位等价。
+                penalty = _l2sp.l2sp_penalty(w, penalty_start, penalty_lam)
+                total += (loss + penalty) * len(index)
+                anchor_grad = _l2sp.l2sp_gradient(w, penalty_start, penalty_lam)
+                for name in grads:
+                    grads[name] = grads[name] + anchor_grad[name]
+            else:
+                total += loss * len(index)
             norm = math.sqrt(float(sum(float(np.sum(g * g)) for g in grads.values())))
             scale = 1.0 if norm <= grad_clip else grad_clip / (norm + 1e-12)
             step += 1
@@ -549,7 +706,7 @@ def _adam(epochs, lr, grad_clip, parent, task, z, y, w, batch, seed,
         final = {name: w[name].copy() for name in w}
     final_moments = {name: [first.copy(), second.copy()]
                      for name, (first, second) in moments.items()}
-    return best, final, history, epochs_run, step, best_metric, best_epoch, final_moments
+    return best, final, history, epochs_run, step, best_metric, best_epoch, final_moments, fresh
 
 
 def _ridge_head(z, y, w, w2_shape, ratios):
@@ -588,12 +745,26 @@ def _ridge_head(z, y, w, w2_shape, ratios):
     return solutions, records
 
 
+def step_plan(arm, round_index):
+    """按轮次返回 {"epochs", "lr_multiplier"}；表外轮次返回 None（沿用臂 profile）。"""
+    try:
+        index = int(round_index)
+    except (TypeError, ValueError):
+        return None
+    for low, high, epochs, multiplier in STEP_DECAY.get(arm, ()):
+        if low <= index <= high:
+            return {"epochs": int(epochs), "lr_multiplier": float(multiplier)}
+    return None
+
+
 def finetune(parent_path, out_dir, data_dir, arm="A", round_index=1, params=None,
-             dataset_key=None):
+             dataset_key=None, history_candidates=None):
     """在官方 MLP 结构上续训一轮，写出 checkpoint.npz 与 train_report.json。
 
     `dataset_key` 用于识别 C 线（"C"）：C 线回归启用 NAS 闸门与 δ 偏置
     （TASK.md：C 主指标 RMSE，NAS 辅助；形态 = RMSE 主选 + NAS 闸门）。
+    `history_candidates` 是 state/history 里的历史候选（[{round, path, sha256}]），
+    仅供 B/C 的 soup 扩对（v7 J1）；A 线是分类，`task == "regression"` 守门，不受影响。
     """
     import numpy as np
 
@@ -602,6 +773,12 @@ def finetune(parent_path, out_dir, data_dir, arm="A", round_index=1, params=None
     profile = dict(ARM_PROFILES.get(arm) or ARM_PROFILES["A"])
     profile.update({key: params[key] for key in ("scope", "epochs", "lr_multiplier")
                     if key in params})
+    # v5 步幅衰减表：后段轮次压 epochs / lr。表值优先于臂 profile；
+    # 环境变量（CONTEST_TRAIN_EPOCHS / CONTEST_TRAIN_LR_MULT）仍可覆盖，供离线实验。
+    plan = step_plan(arm, round_index)
+    if plan:
+        profile["epochs"] = plan["epochs"]
+        profile["lr_multiplier"] = plan["lr_multiplier"]
     if profile["scope"] not in ("all", "head"):
         raise TrainMlpError("scope=%r 不是 all/head" % (profile["scope"],))
 
@@ -659,11 +836,19 @@ def finetune(parent_path, out_dir, data_dir, arm="A", round_index=1, params=None
             profile["scope"], lr, batch, epochs))
 
     history, records = [], []
+    hist_candidates = list(history_candidates or [])  # v7 J1：历史候选端点（非训练曲线）
     best_metric, best_epoch, epochs_run, steps_run = parent_metric, 0, 0, 0
     final = {name: w[name].copy() for name in w}
-    final_moments = _load_moments(parent["arrays"], w)
+    final_moments, fresh_adam = _load_moments(parent["arrays"], w)
+    l2sp_report = {"status": "no_training", "lambda": 0.0, "d_target": None,
+                   "triggered": False, "unconverged": False, "probe_calls": 0,
+                   "trace": [], "would_be": []}
     ridge_choice = None
     if profile["scope"] == "head" and parent["task"] == "regression" and epochs > 0:
+        l2sp_report = {"status": "not_applicable_head", "lambda": 0.0,
+                       "reason": "岭头是闭式解，没有梯度训练，L2-SP 无从注入",
+                       "triggered": False, "unconverged": False, "probe_calls": 0,
+                       "trace": [], "would_be": []}
         solutions, records = _ridge_head(z_train, y_train, w, w["w2"].shape,
                                          DEFAULTS["ridge_ratios"])
         scored = []
@@ -691,13 +876,100 @@ def finetune(parent_path, out_dir, data_dir, arm="A", round_index=1, params=None
                     "train_mse": records[-1]["train_mse"] if records else None,
                     "val": best_metric}]
     elif epochs > 0:
+        steps_per_epoch = int(math.ceil(float(z_train.shape[0]) / float(max(1, batch))))
+        planned_steps = max(1, steps_per_epoch * epochs)
+        arm_cap = weight_rel_cap(arm)
+        d_target, d_target_source = _l2sp_d_target(params, arm)
+        start = {name: w[name].copy() for name in w}
+        trainable = (("w2", "b2") if profile["scope"] == "head"
+                     else ("w1", "b1", "w2", "b2"))
+
+        def _train_once(lam):
+            trial_w = {name: start[name].copy() for name in start}
+            return _adam(
+                epochs, lr, DEFAULTS["grad_clip"], parent["arrays"], parent["task"],
+                z_train, y_train, trial_w, batch, seed, parent_epochs, parent_steps,
+                DEFAULTS["patience"], z_val, y_val, target_mean, target_scale, deadline,
+                trainable=trainable,
+                l2sp=({"lam": float(lam), "start": start} if lam > 0.0 else None))
+
+        class _CalibrationAbort(Exception):
+            pass
+
+        cache, probes = {}, []
+
+        def _measure(lam_key):
+            key = float(lam_key)
+            if key in cache:
+                return cache[key][1]
+            if probes and time.monotonic() > deadline - L2SP_RESERVE_SECONDS:
+                raise _CalibrationAbort()
+            result = _train_once(key)
+            rel = _endpoint_rel_l2(result[0], start)
+            cache[key] = (result, rel)
+            probes.append({"lambda": key, "rel_l2": rel})
+            return rel
+
+        l2sp_report = {
+            "d_target": d_target, "d_target_source": d_target_source, "cap": arm_cap,
+            "eta": lr, "steps": planned_steps,
+            "lambda": 0.0, "triggered": False, "unconverged": False,
+            "d0": None, "d0_tensors": {}, "probe_calls": 0, "trace": [], "would_be": [],
+        }
+        if d_target is None:
+            # 预登记值未定：锚定关闭（λ=0），但 trace 照打——本轮端点位移 d0 就是
+            # 选 d_target 的依据（必须落在 (d0, cap] 之间），"如果启用"的 λ 量级
+            # 用模块的解析初值给出，不额外训练。
+            d0 = _measure(0.0)
+            l2sp_report.update({
+                "status": "not_configured",
+                "reason": "d_target 未预登记，L2-SP 关闭（dry-run 只留痕）",
+                "d0": d0,
+                "d0_tensors": {name: (round(item["rel_l2"], 6) if item["rel_l2"] is not None
+                                      else None)
+                               for name, item in _diff_stats(cache[0.0][0][0], start).items()},
+                "would_be": _l2sp_would_be(d0, lr, planned_steps),
+            })
+            chosen_lambda = 0.0
+        else:
+            calibration = None
+            try:
+                calibration = _l2sp.calibrate_lambda(_measure, d_target, lr, planned_steps)
+            except _CalibrationAbort:
+                calibration = None
+            if calibration is None:
+                status, reason, chosen_lambda = "aborted_deadline", "标定探针撞上时间上限，回退 λ=0", 0.0
+            else:
+                chosen_lambda = float(calibration["lambda"])
+                status = "active"
+                reason = calibration.get("reason")
+                l2sp_report.update({
+                    "triggered": bool(calibration["triggered"]),
+                    "unconverged": bool(calibration["unconverged"]),
+                    "d0": calibration.get("d0"),
+                })
+            if chosen_lambda > 0.0:
+                try:
+                    _measure(chosen_lambda)
+                except _CalibrationAbort:
+                    chosen_lambda = 0.0
+                    status = "aborted_deadline"
+                    reason = "选定 λ 的复训撞上时间上限，回退 λ=0"
+            l2sp_report.update({"status": status, "reason": reason,
+                                "lambda": chosen_lambda})
+        l2sp_report["trace"] = list(probes)
+        l2sp_report["probe_calls"] = max(0, len(cache) - 1)
+        if l2sp_report.get("d0") is None and probes:
+            l2sp_report["d0"] = probes[0]["rel_l2"]
+        if not l2sp_report.get("d0_tensors") and 0.0 in cache:
+            l2sp_report["d0_tensors"] = {
+                name: (round(item["rel_l2"], 6) if item["rel_l2"] is not None else None)
+                for name, item in _diff_stats(cache[0.0][0][0], start).items()}
         (w, final, history, epochs_run, steps_run, best_metric, best_epoch,
-         final_moments) = _adam(
-            epochs, lr, DEFAULTS["grad_clip"], parent["arrays"], parent["task"],
-            z_train, y_train, w, batch, seed, parent_epochs, parent_steps,
-            DEFAULTS["patience"], z_val, y_val, target_mean, target_scale, deadline,
-            trainable=(("w2", "b2") if profile["scope"] == "head"
-                       else ("w1", "b1", "w2", "b2")))
+         final_moments, fresh_adam) = cache[chosen_lambda][0]
+        _log("%s：L2-SP %s，d0=%s cap=%.4f λ=%g（探针 %d 次）"
+             % (arm, l2sp_report["status"], l2sp_report["d0"], arm_cap,
+                chosen_lambda, l2sp_report["probe_calls"]))
 
     if not all(np.all(np.isfinite(array)) for array in list(w.values()) + list(final.values())):
         raise TrainMlpError("训练后出现非有限权重，拒绝产出候选")
@@ -728,7 +1000,7 @@ def finetune(parent_path, out_dir, data_dir, arm="A", round_index=1, params=None
     nas_info = None
     if (parent["task"] == "regression" and weights_changed
             and os.environ.get(ENV_SOUP, "1") != "0"):
-        cap = weight_rel_cap()
+        cap = weight_rel_cap(arm)
         nas_on = (str(dataset_key or "") == "C"
                   and os.environ.get(ENV_NAS_GUARD, "1") != "0")
         raw_tol = os.environ.get(ENV_NAS_TOL)
@@ -740,6 +1012,8 @@ def finetune(parent_path, out_dir, data_dir, arm="A", round_index=1, params=None
                                "regression", target_mean, target_scale)
         nas_parent = nasa_score(y_val, pred_parent) if nas_on else None
         variants = []
+        parent_sha16 = _sha256_file(parent_path)[:16]
+        trained_sha16 = _sha256_arrays(submitted)
         for alpha in SOUP_GRID:
             variant = {name: parent_arrays[name] + alpha * (submitted[name] - parent_arrays[name])
                        for name in ("w1", "b1", "w2", "b2")}
@@ -752,7 +1026,28 @@ def finetune(parent_path, out_dir, data_dir, arm="A", round_index=1, params=None
             if nas_on and nas_v > nas_parent * (1.0 + nas_tol):
                 ok = False
             variants.append({"alpha": alpha, "rel_l2": rel, "rmse": rmse_v,
-                             "nas": nas_v, "ok": bool(ok), "weights": variant})
+                             "nas": nas_v, "ok": bool(ok), "weights": variant,
+                             "pair": "parent-current",
+                             "endpoints": [parent_sha16, trained_sha16]})
+        # ---- v7 J1：历史对变体（父–R1 / 父–R2 / R1–R2），复用同一插值式 ----
+        # 只对 B/C（本块由 task == "regression" 守门）。端点按 sha 去重；血缘
+        # （mean/scale/形状）不符或读取失败的端点整对跳过，原因记进 skipped。
+        pair_specs, pairs_skipped = _history_pair_specs(parent, parent_path, hist_candidates)
+        for spec in pair_specs:
+            for alpha in SOUP_GRID:
+                variant = {name: spec["a"][name] + alpha * (spec["b"][name] - spec["a"][name])
+                           for name in ("w1", "b1", "w2", "b2")}
+                rel = concat_rel_l2(variant, parent["arrays"])
+                pred_v = _predict(z_val, variant["w1"], variant["b1"], variant["w2"],
+                                  variant["b2"], "regression", target_mean, target_scale)
+                rmse_v = float(math.sqrt(float(np.mean((pred_v - y_val) ** 2))))
+                nas_v = nasa_score(y_val, pred_v) if nas_on else None
+                ok = (rel is None or rel <= cap + 1e-12)
+                if nas_on and nas_v > nas_parent * (1.0 + nas_tol):
+                    ok = False
+                variants.append({"alpha": alpha, "rel_l2": rel, "rmse": rmse_v,
+                                 "nas": nas_v, "ok": bool(ok), "weights": variant,
+                                 "pair": spec["id"], "endpoints": list(spec["endpoints"])})
         eligible = [item for item in variants if item["ok"]]
         chosen_v = min(eligible, key=lambda item: item["rmse"]) if eligible else None
         if chosen_v is not None and chosen_v["rmse"] < parent_metric - 1e-12:
@@ -766,8 +1061,15 @@ def finetune(parent_path, out_dir, data_dir, arm="A", round_index=1, params=None
         soup_info = {"cap": cap, "grid": [{k: v for k, v in item.items() if k != "weights"}
                                           for item in variants],
                      "alpha": chosen_v["alpha"] if chosen_v else None,
+                     "pair": chosen_v.get("pair") if chosen_v else None,
+                     "endpoints": chosen_v.get("endpoints") if chosen_v else None,
                      "rel_l2": chosen_v["rel_l2"] if chosen_v else None,
                      "rmse": chosen_v["rmse"] if chosen_v else None,
+                     "pairs": [{"pair": spec["id"], "endpoints": list(spec["endpoints"])}
+                               for spec in pair_specs],
+                     "skipped": pairs_skipped,
+                     "n_variants": len(variants),
+                     "n_eligible": len(eligible),
                      "note": " Adam 矩与步数对应训练端点；α<1 时权重为插值" }
         # δ 偏置：只在 C 线、候选仍保留时。约束 RMSE 升幅 ≤1% 下最小化 NAS。
         if nas_on and weights_changed and chosen_v is not None:
@@ -795,6 +1097,35 @@ def finetune(parent_path, out_dir, data_dir, arm="A", round_index=1, params=None
             nas_info = {"parent": nas_parent, "note": "候选未过闸门，未做 δ 偏置",
                         "nas_tol": nas_tol}
 
+    # ---- v7 J2：fresh Adam 续训装载留痕（行为不变，只把"静默清零"变成可对账项）----
+    # 父产物若是权重空间插值，metadata 会声明 resume_policy=fresh_adam_on_missing_state；
+    # 这里用同一份清单反向对账：声明了就必须四张量全 fresh，没声明就不该有 fresh。
+    interpolation = parent["meta"].get("interpolation")
+    resume_declared = (interpolation.get("resume_policy")
+                       if isinstance(interpolation, dict) else None)
+    adam_ran = bool(epochs_run and profile["scope"] != "head")
+    if not fresh_adam:
+        resume_consistent = True     # 无 fresh，谈不上矛盾
+    elif resume_declared == "fresh_adam_on_missing_state":
+        resume_consistent = set(fresh_adam) == {"w1", "b1", "w2", "b2"}
+    elif resume_declared is None:
+        resume_consistent = None     # 父产物无声明（官方父产物即如此），无从对账
+    else:
+        resume_consistent = False
+    if resume_consistent is False:
+        _log("续训装载与父产物声明不符：declared=%r fresh_adam=%s"
+             % (resume_declared, ",".join(fresh_adam) or "无"))
+    resume = {
+        "fresh_adam": list(fresh_adam),
+        "declared": resume_declared,
+        "consistent": resume_consistent,
+        "policy": ("fresh_adam_on_missing_state" if fresh_adam
+                   else "resume_from_parent_moments"),
+        "adam_ran": adam_ran,
+        "parent_steps": int(parent_steps),
+        "parent_epochs": int(parent_epochs),
+    }
+
     diff = _diff_stats(submitted, parent["arrays"])
     trained_diff = _diff_stats(trained, parent["arrays"])
     report = {
@@ -807,6 +1138,7 @@ def finetune(parent_path, out_dir, data_dir, arm="A", round_index=1, params=None
         "hyper": {"lr": lr, "batch": batch, "epochs_planned": epochs,
                   "epochs_run": epochs_run, "steps": steps_run,
                   "patience": DEFAULTS["patience"], "grad_clip": DEFAULTS["grad_clip"]},
+        "step_plan": dict(plan or {}, round_index=round_index) if plan else None,
         "loss": {"start": history[0].get("train_loss") if history else None,
                  "end": history[-1].get("train_loss") if history else None,
                  "by_epoch": history},
@@ -814,6 +1146,8 @@ def finetune(parent_path, out_dir, data_dir, arm="A", round_index=1, params=None
                 "best_epoch": best_epoch, "final": history[-1].get("val") if history else None,
                 "ridge": records},
         "selection": selection,
+        "resume": resume,
+        "l2sp": l2sp_report,
         "weights_changed": bool(weights_changed),
         "diff": diff,
         "trained_diff": trained_diff,
@@ -838,6 +1172,8 @@ def finetune(parent_path, out_dir, data_dir, arm="A", round_index=1, params=None
             arrays["adam_first_%s" % name] = np.ascontiguousarray(first, dtype=float)
             arrays["adam_second_%s" % name] = np.ascontiguousarray(second, dtype=float)
         meta = dict(parent["meta"])
+        # 父产物的输出侧校准是上一轮斜率的产物，对新权重已失效；本轮由校准候选族重新选。
+        meta.pop("calibration", None)
         meta["steps"] = int(meta.get("steps", 0) or 0) + int(steps_run)
         meta["epochs"] = int(meta.get("epochs", 0) or 0) + int(epochs_run)
         meta["finetune"] = {
@@ -846,10 +1182,22 @@ def finetune(parent_path, out_dir, data_dir, arm="A", round_index=1, params=None
             "batch": batch, "seed": seed, "weights_changed": bool(weights_changed),
             "val": {"metric": metric_name, "parent": parent_metric, "after": best_metric},
             "parent_sha256": report["parent_sha256"],
+            # 本轮装载时的 Adam 续训口径：下一轮据此对账（fresh 清单非空即为 fresh Adam）。
+            "adam_resume": {"fresh": list(fresh_adam), "declared": resume_declared,
+                            "policy": resume["policy"]},
+            # L2-SP：λ 与标定状态。未登记 d_target 时恒为 λ=0（状态 not_configured）。
+            "l2sp": {"status": l2sp_report.get("status"), "lambda": l2sp_report.get("lambda", 0.0),
+                     "d_target": l2sp_report.get("d_target"),
+                     "triggered": l2sp_report.get("triggered", False)},
         }
         if soup_info and soup_info.get("alpha") is not None:
             meta["finetune"]["soup_alpha"] = soup_info["alpha"]
             meta["finetune"]["soup_rel_l2"] = soup_info["rel_l2"]
+            meta["finetune"]["soup_pair"] = soup_info.get("pair")
+            meta["finetune"]["soup_endpoints"] = soup_info.get("endpoints")
+            if soup_info.get("pair") and soup_info["pair"] != "parent-current":
+                # 上传权重是历史对插值，不是本轮训练端点：steps/epochs 只作排程锚。
+                meta["finetune"]["steps_semantics"] = "schedule_anchor_not_trained_steps"
         if nas_info and nas_info.get("delta_b2"):
             meta["finetune"]["delta_b2"] = nas_info["delta_b2"]
         arrays["metadata"] = np.array(json.dumps(meta, ensure_ascii=False, sort_keys=True))
@@ -886,6 +1234,132 @@ def _assert_saved_state(path, weights, moments, steps):
         meta = json.loads(str(np.asarray(archive["metadata"]).tolist()))
         assert int(meta.get("steps", -1)) == int(steps), \
             "写入的 steps=%r 与训练末态 %r 不一致" % (meta.get("steps"), steps)
+
+
+def _sha256_arrays(weights):
+    """四张量的确定性摘要（用于给"训练端点"一个可对账的 sha16）。"""
+    import hashlib
+
+    import numpy as np
+
+    digest = hashlib.sha256()
+    for name in ("w1", "b1", "w2", "b2"):
+        digest.update(name.encode("ascii"))
+        digest.update(np.ascontiguousarray(np.asarray(weights[name], dtype=float)).tobytes())
+    return digest.hexdigest()
+
+
+def _history_pair_specs(parent, parent_path, history):
+    """把 state/history 的历史候选配成端点对：父–R1 / 父–R2 / R1–R2。
+
+    端点按 sha 去重（与父产物同 sha 的直接跳过）；血缘闸门只做本地可判的三件事：
+    四张量形状与父产物一致、mean/scale 逐位一致、文件可读。任一不符整对不进
+    候选族，原因写进 `skipped`。返回 (specs, skipped)。
+    """
+    import numpy as np
+
+    parent_arrays = {name: np.asarray(parent["arrays"][name], dtype=float)
+                     for name in ("w1", "b1", "w2", "b2")}
+    parent_mean = np.asarray(parent["arrays"]["mean"], dtype=float)
+    parent_scale = np.asarray(parent["arrays"]["scale"], dtype=float)
+    endpoints = [{"id": "parent", "sha256": _sha256_file(parent_path),
+                  "arrays": parent_arrays}]
+    skipped = []
+    for entry in history or []:
+        if len(endpoints) >= 3:  # 父 + 两个历史端点，足够组三对
+            break
+        sha = str(entry.get("sha256") or "")
+        path = entry.get("path") or ""
+        label = "R%s" % entry.get("round")
+        if not sha or sha == endpoints[0]["sha256"] or any(e["sha256"] == sha for e in endpoints):
+            continue
+        try:
+            with np.load(path, allow_pickle=False) as store:
+                arrays = {name: np.asarray(store[name], dtype=float)
+                          for name in ("w1", "b1", "w2", "b2")}
+                mean = np.asarray(store["mean"], dtype=float)
+                scale = np.asarray(store["scale"], dtype=float)
+        except Exception as exc:  # noqa: BLE001 - 读不了就不进族
+            skipped.append({"endpoint": label, "reason": "读取失败：%s" % str(exc)[:80]})
+            continue
+        bad = [name for name in ("w1", "b1", "w2", "b2")
+               if arrays[name].shape != parent_arrays[name].shape]
+        if bad:
+            skipped.append({"endpoint": label,
+                            "reason": "形状不符：%s" % "/".join(bad)})
+            continue
+        if not (np.array_equal(mean, parent_mean) and np.array_equal(scale, parent_scale)):
+            skipped.append({"endpoint": label, "reason": "mean/scale 与父产物不一致"})
+            continue
+        endpoints.append({"id": label, "sha256": sha, "arrays": arrays})
+    specs = []
+    for first in range(len(endpoints)):
+        for second in range(first + 1, len(endpoints)):
+            left, right = endpoints[first], endpoints[second]
+            specs.append({
+                "id": "%s--%s" % (left["id"], right["id"]),
+                "endpoints": [left["sha256"][:16], right["sha256"][:16]],
+                "a": left["arrays"], "b": right["arrays"],
+            })
+    return specs, skipped
+
+
+def _endpoint_rel_l2(weights, start):
+    """本轮训练端点相对起点的位移：逐张量 rel_l2 取最大（与权重闸门同口径）。"""
+    import numpy as np
+
+    worst = 0.0
+    for name in ("w1", "b1", "w2", "b2"):
+        current = np.asarray(weights[name], dtype=float)
+        base = np.asarray(start[name], dtype=float)
+        denom = float(np.linalg.norm(base))
+        if denom:
+            worst = max(worst, float(np.linalg.norm(current - base)) / denom)
+    return worst
+
+
+def _l2sp_d_target(params, arm):
+    """d_target 的预登记值：显式参数 > 环境变量 > 按臂预登记表；都没有 = 未登记。
+
+    v7 预登记（2026-11-22 定案）：A = 0.15。依据是平台回执的逐轮 weight_rel_l2
+    （最坏一步 0.1332），0.1332 < 0.15 < cap 0.1696，留 12.4% 余量。B/C 未登记。
+    未登记就不启用锚定（λ=0），也不拿 cap 或 d0 顶上：1.1×cap 会被闸门先拒、
+    1.0×d0 会常态触发，两者都把可移动判据当成了判据。
+    """
+    raw = params.get("l2sp_d_target") if isinstance(params, dict) else None
+    source = "params"
+    if raw is None:
+        raw = os.environ.get(ENV_L2SP_D_TARGET)
+        source = "env"
+    if raw is None:
+        raw = L2SP_D_TARGET_PREREGISTERED.get(str(arm or "").upper())
+        source = "preregistered"
+    if raw is None or not str(raw).strip():
+        return None, "unregistered"
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise TrainMlpError("L2-SP d_target 不是数字：%r（来源 %s）" % (raw, source))
+    if not math.isfinite(value) or value <= 0.0:
+        raise TrainMlpError("L2-SP d_target 必须是正有限数：%r" % (value,))
+    return value, source
+
+
+def _l2sp_would_be(d0, eta, steps):
+    """dry-run：若把 d_target 钉在 0.5/0.7/0.9×d0，解析初值会给到多大 λ。
+
+    只用模块的 `lambda_init` / `expected_rel_l2`，不训练；"expected_rel_l2" 是
+    常梯度近似，仅供看量级，不作判据。
+    """
+    out = []
+    for ratio in L2SP_WOULD_BE_RATIOS:
+        try:
+            lam = _alpha_lib.lambda_init(eta, steps, ratio)
+            out.append({"d_target_over_d0": ratio, "lambda_init": lam,
+                        "expected_rel_l2": _l2sp.expected_rel_l2(d0, lam, eta, steps)})
+        except _alpha_lib.InterpolationError:
+            continue
+    return out
 
 
 def _diff_stats(weights, parent_arrays):

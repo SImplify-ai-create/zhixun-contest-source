@@ -1,0 +1,133 @@
+{
+ "entries": [
+  {
+   "canonical": "json/utf-8/sort_keys/indent=1",
+   "content": {
+    "date": "2026-11-22",
+    "discipline": [
+     "L2-SP 触发语义按实现写：d0 > 1.1 × d_target；A 的 d_target=0.15 对应触发点 0.165，保险区是 (0.165, 0.1696] 与越 cap 轮；任何地方不许写“触发点 0.15”。",
+     "不许写“L2-SP 带来提升”：现行工况下期望触发频率≈0，它是保险不是杠杆。"
+    ],
+    "folds": {
+     "group_by": [
+      "source_subset",
+      "unit"
+     ],
+     "k": 5,
+     "n_units": 496,
+     "shared_across_arms": true,
+     "unit_overlap_between_folds": false,
+     "units_per_fold_approx": 99
+    },
+    "id": "C4-calibration-2026-11-22",
+    "limits": {
+     "covers": [
+      "unseen_unit"
+     ],
+     "cross_line_use": "凡用 C4 预测 A 线行为，须先由第一次真实运行校准",
+     "does_not_cover": [
+      "running_slice"
+     ]
+    },
+    "line_b": {
+     "folds": 9,
+     "groups": 9,
+     "scheme": "leave_one_bearing_out",
+     "shared_across_arms": true
+    },
+    "official_validation": {
+     "disjoint_from_training_folds": true,
+     "not_in_selection": true,
+     "role": "final_adjudication_only",
+     "units": 106
+    },
+    "purpose": "留一机组交叉验证的尺子规格（先定死判据，再看结果）",
+    "scope": "unseen_unit_only",
+    "selection": {
+     "official_validation_in_selection": false,
+     "statistic": "in_fold_mean"
+    }
+   },
+   "date": "2026-11-22",
+   "hash_of": "content",
+   "id": "C4-calibration-2026-11-22",
+   "sha256": "31c807ffeeaa08887a7e566b49a40b74eb77e465b7c31b57cc026aa69c312424"
+  },
+  {
+   "canonical": "json/utf-8/sort_keys/indent=1",
+   "content": {
+    "append_reason": "v1 的内容哈希只覆盖规则文本（K、分组键、共享、不交、只作裁决），不含 (source_subset, unit) → fold 的映射；划分若可事后重抽，'共享划分'无法核验。本版把可复现的归属生成规则纳入被哈希的内容。",
+    "appended_before_implementation": true,
+    "date": "2026-11-22",
+    "discipline": [
+     "L2-SP 触发语义按实现写：d0 > 1.1 × d_target；A 的 d_target=0.15 对应触发点 0.165，保险区是 (0.165, 0.1696] 与越 cap 轮；任何地方不许写“触发点 0.15”。",
+     "不许写“L2-SP 带来提升”：现行工况下期望触发频率≈0，它是保险不是杠杆。"
+    ],
+    "folds": {
+     "assignment": {
+      "reproducible": "同一种子 + 同一 unit 集合 → 同一映射；不需要另存映射表",
+      "rule": "fold = int(sha256(seed + '|' + source_subset + '|' + unit).hexdigest()[:8], 16) % 5",
+      "seed": "c4-2026-11-22",
+      "shared_across_arms": true,
+      "unit_identity": "官方训练集里 (source_subset, unit) 的原始字符串，不做大小写或空白归一化"
+     },
+     "group_by": [
+      "source_subset",
+      "unit"
+     ],
+     "k": 5,
+     "n_units": 496,
+     "shared_across_arms": true,
+     "unit_overlap_between_folds": false,
+     "units_per_fold_approx": 99
+    },
+    "id": "C4-calibration-2026-11-22.v2",
+    "limits": {
+     "covers": [
+      "unseen_unit"
+     ],
+     "cross_line_use": "凡用 C4 预测 A 线行为，须先由第一次真实运行校准",
+     "does_not_cover": [
+      "running_slice"
+     ]
+    },
+    "line_b": {
+     "folds": 9,
+     "groups": 9,
+     "scheme": "leave_one_bearing_out",
+     "shared_across_arms": true
+    },
+    "no_fold_results_seen": true,
+    "official_validation": {
+     "disjoint_from_training_folds": true,
+     "not_in_selection": true,
+     "role": "final_adjudication_only",
+     "units": 106
+    },
+    "purpose": "留一机组交叉验证的尺子规格（先定死判据，再看结果）",
+    "scope": "unseen_unit_only",
+    "selection": {
+     "official_validation_in_selection": false,
+     "statistic": "in_fold_mean"
+    },
+    "statistics": {
+     "metric_scope": "各线官方主指标，固定不随轮次更换",
+     "metrics": {
+      "A": "macro_f1",
+      "B": "rmse",
+      "C": "rmse"
+     },
+     "note": "B 线 9 折每折只有 1 台 bearing，单折分数方差极大：任何单折都不得单独用于选择，只有 9 折均值合法；C 线每折约 99 台，同一句话一并适用。",
+     "selection_statistic": "fold_mean",
+     "single_fold_selection_forbidden": true
+    },
+    "supersedes": "C4-calibration-2026-11-22"
+   },
+   "date": "2026-11-22",
+   "hash_of": "content",
+   "id": "C4-calibration-2026-11-22.v2",
+   "sha256": "1a379d8c20bf728e36751749e29481614d5d651c3390bed6a458298c707321a9"
+  }
+ ],
+ "schema": "contest.v7.preregistration"
+}

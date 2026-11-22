@@ -142,7 +142,12 @@ def _numbers(value, out, depth=0):
     elif isinstance(value, bool):
         return
     elif isinstance(value, (int, float)):
-        number = float(value)
+        try:
+            number = float(value)
+        except OverflowError:
+            # 探测跑在 predict 之前；这里漏出去会把整批 predict 带死，
+            # 而探针的职责是"观测"，不该改变主路径的成败。
+            return
         if number == number and number not in (float("inf"), float("-inf")):
             out.append(number)
 

@@ -40,6 +40,10 @@ PARAM_RANGES = {"alpha": (0.05, 0.95), "eps": (1e-12, 1e-3)}
 CONFIDENCE = ("low", "medium", "high")
 CLOSED_ROUNDS = 6
 TOTAL_ROUNDS = 10
+# 运行时生成（build_script）的第一道门：代码默认关闭。阶段门（CLOSED_ROUNDS）
+# 只是第二道；答辩口径是"通道已实现、默认关闭、二次门限"，三层都要有代码对应。
+RUNTIME_CODE_GEN_ENABLED = False
+RUNTIME_CODE_GEN_ENV = "CONTEST_RUNTIME_CODE_GEN"
 LIMIT_FILES = 64
 LIMIT_BYTES = 64 * 1024 * 1024
 SCRIPT_MAX_CHARS = 4000
@@ -48,7 +52,22 @@ SCRIPT_OUTPUT_CAP = 64 * 1024
 HYPOTHESIS_MAX = 200
 KILL_MAX = 200
 DIGITS = re.compile(r"[0-9]")
+# 数字白名单按"完整数字 token"比较，不做子串剥离：允许的只是平台帧给定的轮次号，
+# 模型自产的 0.02 / 3.5 / 123 仍是越界 token。
+NUMBER_TOKEN = re.compile(r"\d+(?:\.\d+)?")
 LEDGER_REF = re.compile(r"(?:round|ledger|h|H)[-_]?\d+|[A-Za-z]+-\d+")
+NO_HISTORY_PHRASES = (
+    "账本为空",
+    "无历史",
+    "没有历史",
+    "尚无历史",
+    "首个回合",
+    "首次回合",
+    "首轮",
+    "无可引用",
+    "无账本",
+    "账本尚无记录",
+)
 BETTER_WORDS = ("提升", "更好", "改善", "优于", "增益", "变好")
 WORSE_WORDS = ("变差", "回退", "下降", "劣于", "恶化", "退化")
 
@@ -79,6 +98,14 @@ RED_TEAM_TEMPLATE = """逐条回答下面五问，每问必须给出具体字段
 4) 参数是否越出注册区间？
 5) 是否重复了账本中的失败组合？
 只输出 {"q1":"...","q2":"...","q3":"...","q4":"...","q5":"...","verdict":"pass|reject","reason":"≤100字"}"""
+
+
+def runtime_code_gen_enabled():
+    """运行时生成是否被显式打开。默认值由代码常量保证，不靠注释或配置约定。"""
+    raw = os.environ.get(RUNTIME_CODE_GEN_ENV)
+    if raw is None or not str(raw).strip():
+        return bool(RUNTIME_CODE_GEN_ENABLED)
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
 
 class CageError(Exception):
@@ -294,6 +321,8 @@ def _check_params(arm, params):
             raise CageError("PARENT 不接受 params：%r" % (params,))
         return {}
     # 参数表必须与 actions.REGISTRY 一致：identity 不接受任何参数（写入 eps 会让候选在装载期被拒）。
+    # 白名单只放行 alpha/eps（B 只有 eps）。新增键位前须重新评估：像 l2sp_d_target 这类
+    # 训练侧参数一旦从这里放进来，就成了绕过 pre-registration 的侧信道。
     allowed = {"A": ("alpha", "eps"), "B": ("eps",), "C": ()}[arm]
     unknown = sorted(set(params) - set(allowed))
     if unknown:
@@ -314,11 +343,39 @@ def _check_params(arm, params):
 
 
 def _cites_ledger(hypothesis, history_ids):
+    # 空账本：语义判据是"承认了没有历史可引"，不是猜中某个词；闭集短语统一在这里。
+    text = str(hypothesis or "")
     if not history_ids:
-        return "账本为空" in hypothesis or "账本" in hypothesis
-    if any(str(item) in hypothesis for item in history_ids):
+        return any(phrase in text for phrase in NO_HISTORY_PHRASES)
+    if any(str(item) in text for item in history_ids):
         return True
-    return bool(LEDGER_REF.search(hypothesis))
+    return bool(LEDGER_REF.search(text))
+
+
+def classify_failure(errors):
+    """把校验错误串归类成机器可读的失败分类，供账本与审计聚合。"""
+    text = "；".join(str(e) for e in errors or [])
+    if not text:
+        return "none"
+    if "回复为空" in text:
+        return "empty_reply"
+    if "没有可解析的 JSON" in text or "缺 arm" in text or "params 必须是对象" in text:
+        return "parse_error"
+    if "不得出现数字" in text:
+        return "digits_in_hypothesis"
+    if "未点名引用账本行" in text:
+        return "missing_ledger_ref"
+    if "不在闭集" in text:
+        return "arm_not_in_closed_set"
+    if "越界" in text or "必须是数值" in text or "不接受参数" in text or "不接受 params" in text:
+        return "params_out_of_range"
+    if "RUNTIME_CODE_GEN_ENABLED" in text:
+        return "runtime_code_gen_off"
+    if "build_script" in text or "只允许闭集臂菜单" in text:
+        return "phase_violation"
+    if "hypothesis 不能为空" in text or "kill_condition 不能为空" in text:
+        return "missing_field"
+    return "other"
 
 
 def _strip_refs(text, history_ids):
@@ -327,6 +384,15 @@ def _strip_refs(text, history_ids):
     for item in history_ids or []:
         out = out.replace(str(item), "")
     return LEDGER_REF.sub("", out)
+
+
+def _allowed_digits(context):
+    """有界白名单：只允许平台帧给出的当轮轮次号，绝不从模型文本里取。"""
+    try:
+        round_index = int((context or {}).get("round_index"))
+    except (TypeError, ValueError):
+        return set()
+    return {str(round_index)}
 
 
 def validate_proposal(proposal, context):
@@ -344,8 +410,14 @@ def validate_proposal(proposal, context):
         raise CageError("hypothesis 不能为空，且必须点名引用账本行")
     if len(hypothesis) > HYPOTHESIS_MAX:
         raise CageError("hypothesis 超过 %d 字：%d" % (HYPOTHESIS_MAX, len(hypothesis)))
-    if DIGITS.search(_strip_refs(hypothesis, list(context.get("history_ids") or []))):
-        raise CageError("hypothesis 不得出现数字（数字只能来自平台回执）：%r" % hypothesis)
+    allowed = _allowed_digits(context)
+    tokens = NUMBER_TOKEN.findall(_strip_refs(hypothesis,
+                                              list(context.get("history_ids") or [])))
+    offenders = [token for token in tokens if token not in allowed]
+    if offenders:
+        raise CageError("hypothesis 不得出现数字（数字只能来自平台回执）；"
+                        "本轮白名单=%s，越界=%s：%r"
+                        % (sorted(allowed) or "空", offenders, hypothesis))
     if not _cites_ledger(hypothesis, list(context.get("history_ids") or [])):
         raise CageError("hypothesis 未点名引用账本行：%r" % hypothesis)
 
@@ -362,6 +434,12 @@ def validate_proposal(proposal, context):
     phase = context.get("phase") or "closed"
     script = proposal.get("build_script")
     if script:
+        if not runtime_code_gen_enabled():
+            # 第一道门：主动关闭。显式拒绝并说明开关名，绝不静默忽略脚本。
+            raise CageError(
+                "运行时生成通道默认关闭（RUNTIME_CODE_GEN_ENABLED=False），"
+                "本版不接受 build_script；如需开启须显式设置 %s=1"
+                % RUNTIME_CODE_GEN_ENV)
         if phase != "script":
             raise CageError("前 %d 轮只允许闭集臂菜单，不接受 build_script" % CLOSED_ROUNDS)
         if len(script) > SCRIPT_MAX_CHARS:
@@ -401,6 +479,13 @@ def review(text, context):
         "errors": errors,
         "raw_sha256": sha256_text(text),
         "raw_excerpt": str(text or "")[:400],
+        # 审计字段：被拒提案的臂与机器可读的失败分类，别让审计去猜字符串。
+        "proposal_arm_raw": (proposal or {}).get("arm"),
+        "failure_kind": ("none" if accepted is not None else classify_failure(errors)),
+        "auditable": bool((text or "").strip()),
+        # 数字白名单的来源与取值：来源固定是平台帧，取值只含当轮轮次号。
+        "allowed_digits": sorted(_allowed_digits(context)),
+        "allowed_digits_source": "round_frame",
     }
 
 
@@ -495,13 +580,14 @@ OFFICIAL_KEYS = ("w1", "b1", "w2", "b2", "mean", "scale")
 
 
 def _check_official_checkpoint(archive, errors, facts, expected_features,
-                               parent_path=None):
+                               parent_path=None, arm=None):
     """官方格式父检查点：缺 task/coef 不算错（父检查点是平台给的，不是我们编的）。
 
     仍然执行本函数负责的其他校验：形状、有限性、标准化常量、任务推断与特征维。
     体积/文件数已在调用方校验过。给定 parent_path 时追加第 5b 项：权重相对
-    父产物的拼接 rel_l2 不得超过 train_mlp.weight_rel_cap()（默认 0.1）——
-    官方格式没有 coef，原第 5 项恒等校验整段跳过，本项补上这个空档。
+    父产物的拼接 rel_l2 不得超过 train_mlp.weight_rel_cap(arm)——A 线用
+    STEP_DECAY 求和得到的计划累计步幅预算，其余线维持 0.1；官方格式没有
+    coef，原第 5 项恒等校验整段跳过，本项补上这个空档。
     """
     import numpy as np
 
@@ -603,19 +689,26 @@ def _check_official_checkpoint(archive, errors, facts, expected_features,
                     base = {name: np.asarray(par[name], dtype=float)
                             for name in ("w1", "b1", "w2", "b2")}
                     rel = train_mlp.concat_rel_l2(current, base)
-                    cap = train_mlp.weight_rel_cap()
+                    cap = train_mlp.weight_rel_cap(arm)
                     facts["weight_rel_l2"] = rel
                     facts["weight_rel_cap"] = cap
+                    facts["weight_rel_cap_arm"] = str(arm or "")
+                    facts["weight_rel_cap_source"] = (
+                        "planned_cumulative_step_budget"
+                        if str(arm or "").strip().upper() == "A"
+                        else "default_or_env")
                     if rel is not None and rel > cap:
                         errors.append("权重相对父产物拼接 L2=%.4f 超上限 %.4f"
-                                      % (rel, cap))
+                                      "（%s，%s）"
+                                      % (rel, cap, facts["weight_rel_cap_arm"] or "—",
+                                         facts["weight_rel_cap_source"]))
         except Exception as exc:  # noqa: BLE001 - 复核失败视同不过
             errors.append("父检查点权重距离复核失败：%s" % exc)
     return {"ok": not errors, "errors": errors, "facts": facts}
 
 
 def check_candidate(cand_dir, expected_features=None, checkpoint_name="checkpoint.npz",
-                    parent_path=None):
+                    parent_path=None, arm=None):
     """候选性质测试：体积、契约、因果、恒等、维度。不读数据、不跑平台。"""
     errors = []
     facts = {}
@@ -643,7 +736,7 @@ def check_candidate(cand_dir, expected_features=None, checkpoint_name="checkpoin
         if "task" not in archive.files:
             if all(name in archive.files for name in OFFICIAL_KEYS):
                 return _check_official_checkpoint(archive, errors, facts,
-                                                  expected_features, parent_path)
+                                                  expected_features, parent_path, arm)
             errors.append("检查点既缺 task，也不是官方格式（缺 %s）"
                           % "/".join(name for name in OFFICIAL_KEYS
                                      if name not in archive.files))
