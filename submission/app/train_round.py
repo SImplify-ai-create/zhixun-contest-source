@@ -412,7 +412,9 @@ def _call_model(rnd, messages):
     """真实模型调用。空回复时用更大预算重试一次，两次 call_id 都保留。
 
     预算 4096 而不是 512：Qwen3.8 的思维链可能吃光 512，content 为 null。
-    不传 enable_thinking=false：该参数是否被 rnd.model 接受未验证，不支持会 TypeError。
+    v7 显式传 enable_thinking=False：SDK 1.0.4 的 `_MODEL_OPTIONS` 白名单已含该键
+    （contest_harness/round.py），不会再 TypeError；不传则线上默认思维链开，
+    实测同一批 36 轮通过率 2.8% vs 关闭时 44.4%。开关值同时写进账本 configuration.model。
     """
     cap = getattr(rnd, "max_output_tokens", None)
     cap = cap if isinstance(cap, int) and cap > 0 else None
@@ -421,13 +423,15 @@ def _call_model(rnd, messages):
 
     def _once(limit):
         receipt = _rpc_guard("model", rnd.model, messages,
-                             max_tokens=limit, temperature=0)
+                             max_tokens=limit, temperature=0,
+                             enable_thinking=False)
         if fact_probe is not None:
             fact_probe.train_receipt("model", receipt)
         text = getattr(receipt, "text", None)
         text = "" if text is None else str(text)
         call_id = getattr(receipt, "call_id", None)
         rpc_calls.append({"call_id": call_id, "max_tokens": limit,
+                          "enable_thinking": False,
                           "empty": not text.strip(),
                           "response_sha256": llm_cage.sha256_text(text)})
         return receipt, text, call_id, limit
@@ -461,6 +465,7 @@ def _call_model(rnd, messages):
         "call_ids": call_ids,
         "text": text,
         "max_tokens": used,
+        "enable_thinking": False,
         "source": _model_source(rnd, receipt),
         "response_sha256": llm_cage.sha256_text(text),
         "rpc_calls": rpc_calls,
@@ -516,8 +521,17 @@ def _build_candidate(parent, chosen, cand_dir, params=None, data_dir=None,
     target = os.path.join(cand_dir, CHECKPOINT_NAME)
     if chosen == PARENT:
         shutil.copyfile(parent["path"], target)
+        # 本轮根本没训练：soup 不会尝试，必须把"为什么没进 soup"写进账本，
+        # 否则回执只会看到 wc=0 / 同 sha，无法区分"训练后权重没变"与"直接复制父产物"。
         return {"weights_changed": False, "action": None,
-                "sha256": _sha256_file(target)}
+                "sha256": _sha256_file(target),
+                "soup_skip": {
+                    "reason": "candidate_is_parent",
+                    "parent": parent["sha256"][:16],
+                    "history_before": [str(item.get("sha256") or "")[:16]
+                                       for item in (history or [])],
+                    "history_after": [],
+                }}
     import numpy as np
 
     try:
@@ -921,6 +935,10 @@ def _r10_family(prepared, history, parent, data_dir, round_index, dataset_key,
     # 排名按**去重后的权重**算：同一份权重在多个格里出现（α=1 与端点格）不该
     # 把 margin 压成 0，也不该被当成"并列第二"。所选候选必须先过既有 0.1 闸门
     # （A 为计划累计预算），过不了的不参与选型——宁可不上传，也不提交注定被拒的权重。
+    # v3 预登记（2026-11-22 c-push）：C 线的漂移守卫改成"预测位移"，判定点唯一在
+    # train_mlp 的 soup（R10 族这里没有带标签切片，无法算位移）。所以 C 在族内只记录
+    # rel_l2、不据此剔除；A/B 仍按 rel_l2 筛选。
+    guard_enforced = str(dataset_key or "").strip().upper() != "C"
     try:
         weight_cap = float(train_mlp.weight_rel_cap(dataset_key))
     except Exception:  # noqa: BLE001 - 取不到闸门就退化为只记录不筛选
@@ -930,7 +948,7 @@ def _r10_family(prepared, history, parent, data_dir, round_index, dataset_key,
         if cell.get("value") is None or not cell.get("sha"):
             return False
         rel = cell.get("rel_l2")
-        if weight_cap is None or rel is None:
+        if not guard_enforced or weight_cap is None or rel is None:
             return True
         return float(rel) <= weight_cap
 
@@ -966,6 +984,7 @@ def _r10_family(prepared, history, parent, data_dir, round_index, dataset_key,
         "task": task,
         "cap": R10_FAMILY_CAP,
         "weight_cap": weight_cap,
+        "weight_guard": ("pred_disp@soup" if not guard_enforced else "rel_l2"),
         "alphas": [float(a) for a in alphas],
         "tie": tie,
         "margin": margin,
@@ -1014,7 +1033,12 @@ def _r10_family(prepared, history, parent, data_dir, round_index, dataset_key,
                           "interpolated": bool(winner.get("interpolated")),
                           "source_round": winner.get("source_round"),
                           "source": source,
-                          "applied": same_as_payload or same_as_parent,
+                          # applied=是否真的改写了上传载荷；初值一律 False，
+                          # 只有走到 :1080 真正替换成功才置 True。
+                          "applied": False,
+                          "skip_reason": (None if source == "family"
+                                          else ("winner_is_parent" if source == "parent"
+                                                else "winner_is_payload")),
                           "tie": tie}
     if same_as_payload or same_as_parent:
         # 族内最优就是现有载荷或父产物：不改动，只落账。
@@ -1023,6 +1047,7 @@ def _r10_family(prepared, history, parent, data_dir, round_index, dataset_key,
         # 本轮已判 PARENT（终局门/回退）：族照测、分数照记，但不越过门改上传物。
         record["selected"]["applied"] = False
         record["selected"]["blocked"] = "chosen_parent"
+        record["selected"]["skip_reason"] = "final_round_gate"
         return record
 
     # 族内更优：把它做成上传载荷，仍要过体积上限与候选自检。
@@ -2141,6 +2166,7 @@ def run(rnd, data_dir=None, work_dir=None, pessimism_k=None):
                 "call_id": calls[0]["call_id"],
                 "call_ids": _all_call_ids(calls, rnd),
                 "max_tokens": calls[0]["max_tokens"],
+                "enable_thinking": calls[0].get("enable_thinking", False),
                 "proposal": proposal_arm,
                 "status": gate["status"],
                 "hypothesis": (proposal or {}).get("hypothesis"),
@@ -2156,6 +2182,7 @@ def run(rnd, data_dir=None, work_dir=None, pessimism_k=None):
                 "build_errors": build_errors,
             },
             "detectors": detection["detectors"],
+            "detector_registry": detection.get("detector_registry_ledger"),
             "failure_modes": failure["evidence"],
             "data_slice": _slice_card(data, getattr(rnd, "dataset_key", None), rnd),
             # 四臂同尺的逐轮分数：每个臂都在这份验证切片上量过，失败原因逐臂记录。
@@ -2178,6 +2205,11 @@ def run(rnd, data_dir=None, work_dir=None, pessimism_k=None):
         # v7 J4：L2-SP 的 λ 标定 trace 全量进账本（未启用时也是 dry-run 留痕）。
         if training.get("l2sp"):
             cfg["l2sp"] = training["l2sp"]
+        # 诊断：soup 没跑起来时也要留下原因（candidate_is_parent / weights_changed_false /
+        # dedup_remaining_endpoints / lineage_gate / env_off / not_regression）。
+        skip = prep["built"].get("soup_skip") or training.get("soup_skip")
+        if skip:
+            cfg["soup_skip"] = skip
         # v7 J1：soup 候选族（端点对 + 每档 α 的分数 + 选中的 pair），只对回归线存在。
         soup = training.get("soup")
         if soup:
@@ -2196,13 +2228,18 @@ def run(rnd, data_dir=None, work_dir=None, pessimism_k=None):
                 grid = kept
             cfg["soup"] = {
                 "cap": soup.get("cap"),
+                "metric": soup.get("metric"),
+                "cap_value": soup.get("cap_value"),
                 "pair": soup.get("pair"),
                 "endpoints": soup.get("endpoints"),
                 "alpha": soup.get("alpha"),
                 "rel_l2": soup.get("rel_l2"),
+                "pred_disp": soup.get("pred_disp"),
                 "rmse": soup.get("rmse"),
                 "pairs": soup.get("pairs"),
                 "skipped": soup.get("skipped"),
+                "skip_reason": soup.get("skip_reason"),
+                "history": soup.get("history"),
                 "n_variants": soup.get("n_variants"),
                 "n_eligible": soup.get("n_eligible"),
                 "grid": grid,

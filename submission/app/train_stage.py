@@ -24,12 +24,78 @@ if _HERE not in sys.path:
 
 import detectors  # noqa: E402
 import selector  # noqa: E402
+import detector_lib  # noqa: E402
 
 DATA_DIR = "/data"
 TRAIN_NAME = "train.jsonl"
 VAL_NAME = "validation.jsonl"
 TRACE_NAME = "selector_trace.json"
 GROUP_KEYS = ("settings", "condition", "conditions", "group")
+# 路径字符串只由结构决定（与数值无关），同一份数据每行都重复同一组路径。
+# 缓存后每轮只需 json.dumps 特征数那么多次，不再对每个数值各做一次。
+_PATH_TEXT_CACHE = {}
+
+
+def _labels(rows):
+    """分类标签：优先 `label`，其次 `answer`（A 线的类别就写在 answer 里）。
+
+    只接受字符串标签：C/B 的 `answer` 是连续 RUL，不能当类别喂给聚类类检测器，
+    否则会把每台机组的 RUL 当成一个新类。任一行缺失就整体返回 None，不拿部分标签硬算。
+    """
+    if not rows:
+        return None
+    values = []
+    for row in rows:
+        value = row.get("label")
+        if value in (None, ""):
+            value = row.get("answer")
+        if isinstance(value, bool) or value in (None, ""):
+            return None
+        values.append(value)
+    if not all(isinstance(value, str) for value in values):
+        return None
+    return values
+
+
+def _row_field(row, key):
+    """按 顶层 → meta → inputs 三级找字段；平台把 unit/cycle/settings 放在后两层。"""
+    for scope in (row, row.get("meta"), row.get("inputs")):
+        if isinstance(scope, dict):
+            value = scope.get(key)
+            if value not in (None, ""):
+                return value
+    return None
+
+
+def _meta(rows):
+    """可选的单元/快照/工况键；缺哪项就不提供哪项，检测器侧会显式 unavailable。"""
+    meta = {}
+    for key in ("unit", "snapshot"):
+        values = []
+        for row in rows:
+            value = _row_field(row, key)
+            if value is None and key == "snapshot":
+                # FD 系列没有 snapshot 这个名字，时间序号写作 cycle。
+                value = _row_field(row, "cycle")
+            if value is None:
+                values = []
+                break
+            values.append(value)
+        if values:
+            meta[key] = values
+    for key in GROUP_KEYS:
+        values = []
+        for row in rows:
+            value = _row_field(row, key)
+            if value is None:
+                values = []
+                break
+            values.append(str(value))
+        if values:
+            meta["cond_key"] = values
+            break
+    return meta or None
+
 
 
 class TrainStageError(Exception):
@@ -92,7 +158,12 @@ def _flatten_inputs(inputs):
             number = float(value)
             if not math.isfinite(number):
                 raise ValueError("非有限数值")
-            paths.append(json.dumps(path, ensure_ascii=False, separators=(",", ":")))
+            key = tuple((step[0], step[1]) for step in path)
+            text = _PATH_TEXT_CACHE.get(key)
+            if text is None:
+                text = json.dumps(path, ensure_ascii=False, separators=(",", ":"))
+                _PATH_TEXT_CACHE[key] = text
+            paths.append(text)
             values.append(number)
         else:
             raise ValueError("inputs 只接受有限数值，实际为 %r" % (value,))
@@ -167,6 +238,15 @@ def run(data_dir=None, out_dir=None, task=None):
                               % (train_x.shape[0], val_x.shape[0]))
 
     report = detectors.run_all(train_x, val_x, stage="train")
+    # v1 检测器库（19 条，三态）：只做观测与落账，不参与 select；
+    # report["detectors"] 的三个数保持逐位不变。
+    report["detector_registry"] = detector_lib.run(
+        train_x, val_x, stage="train",
+        labels_train=_labels(train_rows), labels_val=_labels(val_rows),
+        meta_train=_meta(train_rows), meta_val=_meta(val_rows))
+    # 账本只存压缩视图：configuration 有 8 KiB 预算，完整读数留在 detector_report 里。
+    report["detector_registry_ledger"] = detector_lib.ledger_view(
+        report["detector_registry"])
     chosen, trace = selector.select(report, has_group=_has_group(train_rows, val_rows))
     trace["inputs"].update({
         "data_dir": os.path.abspath(data_dir),

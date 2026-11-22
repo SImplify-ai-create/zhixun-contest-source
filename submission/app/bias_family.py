@@ -56,8 +56,13 @@ EMA_ALPHA = 0.3
 A_GRID = (0.90, 0.95, 1.00, 1.05, 1.10)
 C_GRID = (5.0, 2.0, 0.0, -2.0, -5.0)
 # v7：C 线校准 a 的端点。依据是 T1/F1 两次回执里"网格最优 a=1.05，EMA 却走到 1.083877"：
-# 同一份数据里网格自己给的边界就是 1.05，滑窗不该越过它。c 暂不设界，只记 |c|/target_scale。
+# 同一份数据里网格自己给的边界就是 1.05，滑窗不该越过它。
+# v7.1（2026-11-22 c-push）：截断同时作用于 **EMA 状态**（回写），否则上一轮钳制过的
+# a 仍按未截断序列继续增长（C 线账本 R1→R9 的 a_before=1.015→1.0921 就是这个）。
 C_A_BOUND = 0.05
+# C 线校准截距 c 的端点，单位是预测单位（周期）。生产账本实测到过 −4.342066。
+# 折内拟合把 c 打到 ±5 网格两端且逐折换号（+1.5/−1.5/−0.6/−1.5/−0.6），故上界取 ±2。
+C_C_BOUND = 2.0
 # 旧的标量 δ 网格（c 的特例），只留作子集与留痕，不进本版候选族。
 DELTA_GRID = tuple(train_mlp.DELTA_GRID)
 # A 的逐类偏移幅度（一次只动一类）。闸门未开时不生成这些候选。
@@ -259,6 +264,27 @@ def sanitize_calibration_c(value):
     return raw, False
 
 
+def clamp_calibration_c(value):
+    """C 线校准截距 c 的端点截断：|c| ≤ C_C_BOUND（预测单位=周期）。
+
+    v7.1（2026-11-22 c-push）：旧实现只挡非有限值、不设上界，生产账本实测到过
+    c=−4.342066。C4 五折的折内拟合把 c 打到网格两端 ±5，逐折符号还随折翻转
+    （+1.5/−1.5/−0.6/−1.5/−0.6），说明它是在拟合当轮切片的偏差而不是可迁移的偏移。
+    这里把写入值和 EMA 状态都压到 ±C_C_BOUND，间隔仍是"预测量纲"而不是 a 的比例。
+
+    返回 (写入值, clamped, sanitized, 原始值)。
+    """
+    raw = float(value)
+    if not math.isfinite(raw):
+        value, sanitized = sanitize_calibration_c(raw)
+        return value, False, sanitized, raw
+    if raw > C_C_BOUND:
+        return C_C_BOUND, True, False, raw
+    if raw < -C_C_BOUND:
+        return -C_C_BOUND, True, False, raw
+    return raw, False, False, raw
+
+
 def _pack_grid(entries):
     """按分数保留 top-N（含最优），并标注被截断的总数。"""
     if len(entries) <= GRID_RECORD_MAX:
@@ -422,7 +448,14 @@ def apply(dataset_key, data_dir, parent_path, prepared, work_dir, round_index,
     prev_entry = ((previous_state or {}).get("bias_ema") or {}).get(key)
     rounds = int(prev_entry.get("rounds", 0)) if isinstance(prev_entry, dict) else 0
     if key == "C":
-        state = {name: _round(value) for name, value in ema_after.items()}
+        # 回写钳制后的值：否则"当轮应用 1.05、账本记 1.052995"，下一轮 prior 继续沿
+        # 未截断序列爬升。state 必须等于实际生效的值，回放才能逐位复现。
+        a_state, a_clamped_state, _, _ = clamp_calibration_a(ema_after["a"])
+        c_state, c_clamped_state, _, _ = clamp_calibration_c(ema_after["c"])
+        state = {"a": _round(a_state), "c": _round(c_state)}
+        record["ema"]["state_clamped"] = bool(a_clamped_state or c_clamped_state)
+        record["ema"]["state_raw"] = {"a": _round(ema_after["a"]),
+                                      "c": _round(ema_after["c"])}
     else:
         state = {"offset": [_round(value) for value in ema_after["offset"]]}
     state["rounds"] = rounds + 1
@@ -481,7 +514,7 @@ def _apply_final(record, prepared, arrays, meta, chosen, parent_path,
         # 不能和"越界被压回"共用一个 clamped=true。
         a_value, a_clamped, a_sanitized, a_raw = clamp_calibration_a(chosen["a"])
         c_raw = float(chosen["c"])
-        c_value, c_sanitized = sanitize_calibration_c(c_raw)
+        c_value, c_clamped, c_sanitized, _c_raw = clamp_calibration_c(c_raw)
         sanitized = bool(a_sanitized or c_sanitized)
         scale = float(meta.get("target_scale", 1.0) or 1.0)
         if not math.isfinite(scale) or scale == 0.0:
@@ -490,15 +523,17 @@ def _apply_final(record, prepared, arrays, meta, chosen, parent_path,
         stamp["calibration"] = {"a": a_value, "c": c_value, "source": source,
                                 "alpha": EMA_ALPHA, "round": int(round_index),
                                 "clamped": bool(a_clamped),
+                                "c_clamped": bool(c_clamped),
                                 "sanitized": sanitized,
                                 "c_abs_over_scale": _round(abs(c_value) / abs(scale))}
         if a_clamped or a_sanitized:
             stamp["calibration"]["a_before_clamp"] = _json_safe_number(a_raw)
-        if c_sanitized:
+        if c_clamped or c_sanitized:
             stamp["calibration"]["c_before"] = _json_safe_number(c_raw)
         applied = abs(a_value - 1.0) > 1e-12 or abs(c_value) > 1e-12
         record["chosen_plain"] = {"a": a_value, "c": c_value}
         record["clamp"] = {"clamped": bool(a_clamped),
+                           "c_clamped": bool(c_clamped),
                            "sanitized": sanitized,
                            "a_after": _round(a_value),
                            "a_before": _json_safe_number(a_raw),

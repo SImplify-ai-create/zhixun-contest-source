@@ -91,7 +91,7 @@ DEFAULTS = {
     "beta1": 0.9,
     "beta2": 0.999,
     "adam_eps": 1e-8,
-    "ridge_ratios": (0.0, 1e-6, 1e-4, 1e-3, 1e-2),
+    "ridge_ratios": (0.0, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2),
     "keep_parent_if_worse": True,
     "max_seconds": 600.0,
 }
@@ -99,8 +99,13 @@ DEFAULTS = {
 ENV_LR = "CONTEST_TRAIN_LR_MULT"
 ENV_EPOCHS = "CONTEST_TRAIN_EPOCHS"
 ENV_NO_GUARD = "CONTEST_TRAIN_KEEP_PARENT"
-# 岭回归选系数的容忍带：比验证最优差 1.5% 以内时取最大的 λ（最小权重范数）。
-RIDGE_TOLERANCE = 0.015
+# 岭回归选系数的容忍带：取验证集上 RMSE 最小的那个 λ（容忍带归零）。
+# v7.1（2026-11-22 c-push）：原值 0.015 表示"比最优差 1.5% 以内取最大 λ（最小权重范数）"。
+# C4 五折（seed=c4-2026-11-22，496 台按 (source_subset,unit) 分组）实测：λ 曲线在
+# 0→1e-2 上单调，内层验证与折外的 argmin 都落在 0~1e-5；容忍带把 λ 推到 1e-2，
+# 纯岭头的折外 RMSE 从 54.2633（λ=1e-6）抬到 54.8391（λ=1e-2），5/5 折一致变差。
+# 依据与逐折数字见 d:\智能比赛\2026-11-22\c-push\outputs\C线攻坚结论.md。
+RIDGE_TOLERANCE = 0.0
 # 固定标尺的最低有效行占比。低于此值说明切片大面积丢行（结构/标签不匹配），
 # 此时任何两参数拟合都只是"有解"，不是"可评"，宁可让本轮退回父产物。
 MIN_VALID_RATIO = 0.5
@@ -109,6 +114,13 @@ MIN_VALID_RATIO = 0.5
 # 权重相对父产物的拼接 L2 上限。check_candidate 与 soup 共用同一口径，两处必须同源。
 ENV_REL_CAP = "CONTEST_WEIGHT_REL_CAP"
 REL_CAP_DEFAULT = 0.1
+# v3 预登记（2026-11-22 c-push）：C 线的守卫度量从"权重拼接 rel_l2"换成"预测位移"。
+#   disp = RMS(pred_candidate − pred_parent) / |target_scale|，在当轮 validation 切片上
+#   用未校准预测算。阈值 0.11 由 C4 五折敏感性表定（0.09→54.3430、0.10→54.2369、
+#   0.11→54.2218、0.12→54.2218，带校准口径）；0.11 与 0.10 的差 0.0151 在折间噪声内，
+#   按"同等就取更宽一档"取 0.11，且 0.11–0.12 是平台。定位是"位移记录 + 极端拦截"，
+#   不宣称保护力（5 折 30 候选 AUC(bad>good)=0.167）。仅 C 线生效；A/B 仍用 rel_l2。
+C_PRED_DISP_CAP = 0.11
 # A 线的上限不再用单轮常数，而是"计划累计步幅预算"：把 STEP_DECAY 每轮的
 # epochs × lr_multiplier 加起来，乘单轮实测锚点。锚点取 A 线公开切片上
 # lr×1.0、best_epoch=1 的提交 rel_l2=0.0160（见 STEP_DECAY 注释）。
@@ -426,6 +438,21 @@ def concat_rel_l2(current, parent_arrays):
     if den <= 0.0:
         return None
     return math.sqrt(num) / math.sqrt(den)
+
+
+def _pred_displacement(pred, pred_parent, target_scale):
+    """C 线守卫度量（v3）：预测空间 RMS 位移，按 target_scale 归一。
+
+    对闭式头，权重 rel_l2 会被参数化尺度放大（λ→1e-5 时岭头 rel 1.7–3.6，但折外
+    预测未发散）；这里直接量函数空间位移。分母取 |target_scale|，所以阈值是无量纲的。
+    """
+    import numpy as np
+
+    scale = abs(float(target_scale))
+    if scale <= 0.0:
+        return float("inf")
+    diff = np.asarray(pred, dtype=float) - np.asarray(pred_parent, dtype=float)
+    return float(math.sqrt(float(np.mean(diff * diff)))) / scale
 
 
 def planned_cumulative_rel_budget(arm="A", rounds=PLAN_ROUNDS,
@@ -860,8 +887,7 @@ def finetune(parent_path, out_dir, data_dir, arm="A", round_index=1, params=None
             record["w2_norm"] = float(np.linalg.norm(w2))
             scored.append((float(record["ridge_ratio"]), metric, trial))
             final = {name: trial[name].copy() for name in trial}
-        # 验证最优往往落在 λ→0 的边界解上，权重会被放大十几倍；在"比最优差 1.5%
-        # 以内"的解里取最大的 λ（最小权重范数），换隐藏集上的稳健性。
+        # 验证最优就在 λ 的下边界（0~1e-5）时容忍带已归零，这里退化成 argmin。
         lowest = min(item[1] for item in scored)
         ceiling = lowest * (1.0 + RIDGE_TOLERANCE)
         ratio, metric, trial = max((item for item in scored if item[1] <= ceiling),
@@ -996,13 +1022,31 @@ def finetune(parent_path, out_dir, data_dir, arm="A", round_index=1, params=None
     # 依据（2026-11-20 研判）：三线公开→隐藏迁移率与更新幅度单调反向；C 岭头
     # w2 相对变化 80.6%，拼接 rel_l2≈0.4，必须插值收缩；C 的 NAS 由尾部少数
     # 大误差样本支配，RMSE 主选会放过 NAS 灾难候选（R7→R9 +134%）。
+    # v7.1（2026-11-22 c-push）：C 的 NASA 不计分，NAS 闸门与 δ 偏置默认关闭
+    # （CONTEST_NAS_GUARD 缺省值由 "1" 改为 "0"，需要旧行为时显式置 1）。
+    # C4 五折实测：闸门 5/5 折从不 binding（开/关逐折同值）；真正花掉 RMSE 的是
+    # δ 偏置——真实 app 路径 5 折均值 −0.2987（55.136673 → 54.838013），3/5 折变差、
+    # fold4 单项 +2.32（b2 下移 −0.2）。
     soup_info = None
     nas_info = None
+    # 诊断用：soup 没跑时也要能回答"为什么没跑"（weights_changed / env_off /
+    # dedup_remaining_endpoints / lineage_gate / final_round_gate）。只落账，不参与决策。
+    parent_sha16_hint = _sha256_file(parent_path)[:16]
+    history_before = [str(item.get("sha256") or "")[:16]
+                      for item in (hist_candidates or [])]
+    history_after = []
+    for sha16 in history_before:
+        if sha16 and sha16 != parent_sha16_hint and sha16 not in history_after:
+            history_after.append(sha16)
+    soup_skip = None
     if (parent["task"] == "regression" and weights_changed
             and os.environ.get(ENV_SOUP, "1") != "0"):
-        cap = weight_rel_cap(arm)
+        # 资格线必须与最终候选自检同源：check_candidate 用的是 dataset_key（线），
+        # 不是本轮选中的适应臂。此前用 arm，B/C 线回退到 A 臂时会把上限放宽成 A 的
+        # 累计步幅预算（10 轮 0.1696），随后又被最终自检按 0.1 拒掉，白跑一轮。
+        cap = weight_rel_cap(dataset_key or arm)
         nas_on = (str(dataset_key or "") == "C"
-                  and os.environ.get(ENV_NAS_GUARD, "1") != "0")
+                  and os.environ.get(ENV_NAS_GUARD, "0") != "0")
         raw_tol = os.environ.get(ENV_NAS_TOL)
         nas_tol = float(raw_tol) if raw_tol else NAS_TOL_DEFAULT
         parent_arrays = {name: np.asarray(parent["arrays"][name], dtype=float)
@@ -1011,6 +1055,7 @@ def finetune(parent_path, out_dir, data_dir, arm="A", round_index=1, params=None
                                parent_arrays["w2"], parent_arrays["b2"],
                                "regression", target_mean, target_scale)
         nas_parent = nasa_score(y_val, pred_parent) if nas_on else None
+        is_c = (str(dataset_key or "") == "C")
         variants = []
         parent_sha16 = _sha256_file(parent_path)[:16]
         trained_sha16 = _sha256_arrays(submitted)
@@ -1022,11 +1067,14 @@ def finetune(parent_path, out_dir, data_dir, arm="A", round_index=1, params=None
                               variant["b2"], "regression", target_mean, target_scale)
             rmse_v = float(math.sqrt(float(np.mean((pred_v - y_val) ** 2))))
             nas_v = nasa_score(y_val, pred_v) if nas_on else None
-            ok = (rel is None or rel <= cap + 1e-12)
+            disp = _pred_displacement(pred_v, pred_parent, target_scale) if is_c else None
+            ok = ((disp <= C_PRED_DISP_CAP + 1e-12) if is_c
+                  else (rel is None or rel <= cap + 1e-12))
             if nas_on and nas_v > nas_parent * (1.0 + nas_tol):
                 ok = False
             variants.append({"alpha": alpha, "rel_l2": rel, "rmse": rmse_v,
                              "nas": nas_v, "ok": bool(ok), "weights": variant,
+                             "pred_disp": disp,
                              "pair": "parent-current",
                              "endpoints": [parent_sha16, trained_sha16]})
         # ---- v7 J1：历史对变体（父–R1 / 父–R2 / R1–R2），复用同一插值式 ----
@@ -1042,11 +1090,14 @@ def finetune(parent_path, out_dir, data_dir, arm="A", round_index=1, params=None
                                   variant["b2"], "regression", target_mean, target_scale)
                 rmse_v = float(math.sqrt(float(np.mean((pred_v - y_val) ** 2))))
                 nas_v = nasa_score(y_val, pred_v) if nas_on else None
-                ok = (rel is None or rel <= cap + 1e-12)
+                disp = _pred_displacement(pred_v, pred_parent, target_scale) if is_c else None
+                ok = ((disp <= C_PRED_DISP_CAP + 1e-12) if is_c
+                      else (rel is None or rel <= cap + 1e-12))
                 if nas_on and nas_v > nas_parent * (1.0 + nas_tol):
                     ok = False
                 variants.append({"alpha": alpha, "rel_l2": rel, "rmse": rmse_v,
                                  "nas": nas_v, "ok": bool(ok), "weights": variant,
+                                 "pred_disp": disp,
                                  "pair": spec["id"], "endpoints": list(spec["endpoints"])})
         eligible = [item for item in variants if item["ok"]]
         chosen_v = min(eligible, key=lambda item: item["rmse"]) if eligible else None
@@ -1058,16 +1109,27 @@ def finetune(parent_path, out_dir, data_dir, arm="A", round_index=1, params=None
             weights_changed = False
             selection = "parent_kept"
             chosen_v = None
-        soup_info = {"cap": cap, "grid": [{k: v for k, v in item.items() if k != "weights"}
+        soup_info = {"cap": cap,
+                     "metric": ("pred_disp" if is_c else "rel_l2"),
+                     "cap_value": (C_PRED_DISP_CAP if is_c else cap),
+                     "grid": [{k: v for k, v in item.items() if k != "weights"}
                                           for item in variants],
                      "alpha": chosen_v["alpha"] if chosen_v else None,
                      "pair": chosen_v.get("pair") if chosen_v else None,
                      "endpoints": chosen_v.get("endpoints") if chosen_v else None,
                      "rel_l2": chosen_v["rel_l2"] if chosen_v else None,
+                     "pred_disp": chosen_v.get("pred_disp") if chosen_v else None,
                      "rmse": chosen_v["rmse"] if chosen_v else None,
                      "pairs": [{"pair": spec["id"], "endpoints": list(spec["endpoints"])}
                                for spec in pair_specs],
                      "skipped": pairs_skipped,
+                     "history": {"parent": parent_sha16_hint,
+                                 "before": history_before,
+                                 "after": history_after,
+                                 "n_cross_pairs": len(pair_specs)},
+                     "skip_reason": (None if pair_specs
+                                     else ("dedup_remaining_endpoints" if not pairs_skipped
+                                           else "lineage_gate")),
                      "n_variants": len(variants),
                      "n_eligible": len(eligible),
                      "note": " Adam 矩与步数对应训练端点；α<1 时权重为插值" }
@@ -1096,6 +1158,19 @@ def finetune(parent_path, out_dir, data_dir, arm="A", round_index=1, params=None
         elif nas_on:
             nas_info = {"parent": nas_parent, "note": "候选未过闸门，未做 δ 偏置",
                         "nas_tol": nas_tol}
+    if soup_info is None:
+        if parent["task"] != "regression":
+            reason = "not_regression"
+        elif not weights_changed:
+            reason = "weights_changed_false"
+        elif os.environ.get(ENV_SOUP, "1") == "0":
+            reason = "env_off"
+        else:
+            reason = "unknown"
+        soup_skip = {"reason": reason, "parent": parent_sha16_hint,
+                     "history_before": history_before,
+                     "history_after": history_after,
+                     "weights_changed": bool(weights_changed)}
 
     # ---- v7 J2：fresh Adam 续训装载留痕（行为不变，只把"静默清零"变成可对账项）----
     # 父产物若是权重空间插值，metadata 会声明 resume_policy=fresh_adam_on_missing_state；
@@ -1152,6 +1227,7 @@ def finetune(parent_path, out_dir, data_dir, arm="A", round_index=1, params=None
         "diff": diff,
         "trained_diff": trained_diff,
         "soup": soup_info,
+        "soup_skip": soup_skip,
         "nas": nas_info,
         "seconds": round(time.monotonic() - started, 3),
     }
@@ -1192,6 +1268,9 @@ def finetune(parent_path, out_dir, data_dir, arm="A", round_index=1, params=None
         }
         if soup_info and soup_info.get("alpha") is not None:
             meta["finetune"]["soup_alpha"] = soup_info["alpha"]
+            meta["finetune"]["soup_metric"] = soup_info.get("metric")
+            meta["finetune"]["soup_cap_value"] = soup_info.get("cap_value")
+            meta["finetune"]["soup_pred_disp"] = soup_info.get("pred_disp")
             meta["finetune"]["soup_rel_l2"] = soup_info["rel_l2"]
             meta["finetune"]["soup_pair"] = soup_info.get("pair")
             meta["finetune"]["soup_endpoints"] = soup_info.get("endpoints")

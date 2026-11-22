@@ -77,7 +77,7 @@ PROPOSAL_TEMPLATE = """你是本轮候选选择器。只输出一个 JSON 对象
 硬约束（违反即作废，逐条自查后再输出）：
 1) 不得使用任何序号大于当前行的信息；
 2) 不得选择 transductive 动作：{冻结清单}；
-3) 参数必须落在给定区间：{区间表}；
+3) 参数必须与你所选臂的契约一致：{区间表}；多余键会被直接拒收。
 4) 不得重复账本中已判失败的"签名 × 臂"组合：{失败清单}。
 
 可选臂（只能从中选一个）：{枚举}
@@ -193,9 +193,26 @@ def _transductive_list():
     return ", ".join(actions.transductive_actions())
 
 
+def _range(name):
+    low, high = PARAM_RANGES[name]
+    return "[%g, %g]" % (low, high)
+
+
+def arm_contract(arm):
+    """单个臂的参数契约。与 _check_params 的 allowed 表同源，只换表述。"""
+    arm = str(arm or "PARENT").strip().upper()
+    if arm == "A":
+        return "A 接受 alpha%s 与 eps%s" % (_range("alpha"), _range("eps"))
+    if arm == "B":
+        return "B 只接受 eps%s" % _range("eps")
+    if arm == "C":
+        return "C 不接受任何参数"
+    return "PARENT 不接受任何参数"
+
+
 def _ranges_text():
-    return json.dumps({key: list(value) for key, value in PARAM_RANGES.items()},
-                      ensure_ascii=False, sort_keys=True)
+    """按臂给契约，不再输出与臂无关的全局区间表。"""
+    return "；".join(arm_contract(arm) for arm in ARMS)
 
 
 def _failed_text(failed):
@@ -231,6 +248,11 @@ def build_messages(card, data_summary, detectors, rule_recommendation,
         "detectors": detectors,
         "rule_recommendation": rule_recommendation,
     }
+    # 推荐某臂时，把该臂自己的参数契约一并给出，避免“推荐 B 却按 A 的参数表填”。
+    if isinstance(rule_recommendation, dict):
+        arm = str(rule_recommendation.get("candidate") or "PARENT").strip().upper()
+        payload["rule_recommendation"] = dict(rule_recommendation,
+                                              param_contract=arm_contract(arm))
     return [
         {"role": "system", "content": text},
         {"role": "user",
@@ -271,6 +293,42 @@ def red_team_messages(proposal, facts, failed_combos):
     ]
 
 
+def _iter_balanced_objects(raw):
+    """从头扫描配平的 {...} 片段，跳过字符串里的花括号与转义引号。
+
+    只做切片，不判断合法性：合法性交给 json.loads。
+    前一对象不合法时继续从下一个 `{` 开始，避免思维链里的草稿对象连带整段作废。
+    """
+    start = raw.find("{")
+    while start != -1:
+        depth = 0
+        in_string = False
+        escaped = False
+        for index in range(start, len(raw)):
+            char = raw[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    yield raw[start:index + 1]
+                    start = raw.find("{", index + 1)
+                    break
+        else:
+            # 这个起点没配平（截断或残缺），换下一个起点
+            start = raw.find("{", start + 1)
+
+
 def _extract_json(text):
     raw = str(text or "").strip()
     if not raw:
@@ -278,14 +336,14 @@ def _extract_json(text):
     fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.S)
     if fenced:
         raw = fenced.group(1)
-    match = re.search(r"\{.*\}", raw, re.S)
-    if not match:
-        return None, "unusable"
-    try:
-        obj = json.loads(match.group(0))
-    except ValueError:
-        return None, "unusable"
-    return (obj if isinstance(obj, dict) else None), ("ok" if isinstance(obj, dict) else "unusable")
+    for candidate in _iter_balanced_objects(raw):
+        try:
+            obj = json.loads(candidate)
+        except ValueError:
+            continue
+        if isinstance(obj, dict):
+            return obj, "ok"
+    return None, "unusable"
 
 
 def parse_proposal(text):
@@ -679,6 +737,10 @@ def _check_official_checkpoint(archive, errors, facts, expected_features,
         errors.append("特征维 %s 与数据 %s 不一致" % (facts.get("feature_dim"), expected_features))
 
     # 第 5b 项：权重漂移幅度上限（与 soup 同源口径；PARENT 逐字节副本 rel=0 必过）。
+    # v3 预登记（2026-11-22 c-push）：C 线改用"预测位移"守卫，判定点前移到 train_mlp
+    # 的 soup（那里有带标签的当轮切片，cage 不读数据拿不到标签）。所以 C 在这里只
+    # **记录** rel_l2，不再据此报错；A/B 仍按 rel_l2 报错。
+    is_c = str(arm or "").strip().upper() == "C"
     if parent_path and os.path.isfile(parent_path):
         try:
             import train_mlp
@@ -693,11 +755,12 @@ def _check_official_checkpoint(archive, errors, facts, expected_features,
                     facts["weight_rel_l2"] = rel
                     facts["weight_rel_cap"] = cap
                     facts["weight_rel_cap_arm"] = str(arm or "")
+                    facts["weight_rel_cap_enforced"] = not is_c
                     facts["weight_rel_cap_source"] = (
                         "planned_cumulative_step_budget"
                         if str(arm or "").strip().upper() == "A"
-                        else "default_or_env")
-                    if rel is not None and rel > cap:
+                        else ("pred_disp_at_soup" if is_c else "default_or_env"))
+                    if (not is_c) and rel is not None and rel > cap:
                         errors.append("权重相对父产物拼接 L2=%.4f 超上限 %.4f"
                                       "（%s，%s）"
                                       % (rel, cap, facts["weight_rel_cap_arm"] or "—",
