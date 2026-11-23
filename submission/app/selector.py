@@ -14,6 +14,8 @@
 
 from actions import CAUSAL, REGISTRY, kind_of
 
+import math
+
 THRESHOLDS = {
     # 直方图 KL 在小样本下有正的估计偏差（n=200、10 分箱时噪声地板约 0.06），
     # 阈值取 0.15 是为了不被这个偏差顶穿；明显漂移（如均值平移 30σ）在几十仍远高于它。
@@ -115,3 +117,58 @@ def select(report, has_group=False):
         "threshold_note": "阈值量级取自 v1 drift-benchmark 的噪声地板/信号量级，未经本轮调参",
     }
     return chosen, trace
+
+
+def best_scored_arm(record):
+    """四臂同尺记录里严格优于当前臂的最优臂；没有则 None。
+
+    只读 `_score_arms` 的落账结构，不重跑、不读平台回执。与 `select()` 的分工：
+    `select()` 是训练前的预登记规则选臂（验证盲）；本函数只用于候选已造好、
+    同一把尺子已量过之后的载荷接管判断。平局不接管，避免只为名字顺序换臂。
+    """
+    arms = (record or {}).get("arms") or {}
+    metric = ((record or {}).get("slice") or {}).get("metric")
+    if metric not in ("rmse", "macro_f1"):
+        return None
+    rows = []
+    for name, item in arms.items():
+        if name == "PARENT" or not isinstance(item, dict) or item.get("status") != "ok":
+            continue
+        # changed=false 等价于父副本（sha 与 PARENT 相同），不是真实新候选；
+        # 它即使分数更好也只是"退回父"，由 _apply_local_best 负责，不在这里接管。
+        if item.get("changed") is False:
+            continue
+        value = item.get("value")
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            continue
+        if not math.isfinite(float(value)):
+            continue
+        rows.append((float(value), name))
+    if not rows:
+        return None
+    value, name = (min(rows) if metric == "rmse" else max(rows))
+    chosen = (record or {}).get("chosen")
+    if chosen == "PARENT":
+        return None
+    current = (arms.get(chosen) or {}).get("value")
+    if not isinstance(current, (int, float)) or isinstance(current, bool):
+        return name
+    current = float(current)
+    if metric == "rmse":
+        return name if value < current - 1e-12 else None
+    return name if value > current + 1e-12 else None
+
+
+def best_arm_delta(record, arm):
+    """接管臂相对当前臂的分数改进量（rmse 为旧−新，macro_f1 为新−旧）；不可算时 None。"""
+    arms = (record or {}).get("arms") or {}
+    metric = ((record or {}).get("slice") or {}).get("metric")
+    chosen = (record or {}).get("chosen")
+    new = (arms.get(arm) or {}).get("value")
+    old = (arms.get(chosen) or {}).get("value")
+    if metric not in ("rmse", "macro_f1"):
+        return None
+    if not all(isinstance(v, (int, float)) and not isinstance(v, bool)
+               for v in (new, old)):
+        return None
+    return (float(old) - float(new)) if metric == "rmse" else (float(new) - float(old))

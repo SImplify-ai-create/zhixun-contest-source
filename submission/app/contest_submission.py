@@ -46,6 +46,7 @@ sys.dont_write_bytecode = True
 import json  # noqa: E402
 import math  # noqa: E402
 import os  # noqa: E402
+import re  # noqa: E402
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:  # 同一目录的 actions / train_stage 才可被导入
@@ -59,6 +60,9 @@ TASKS = ("classification", "regression")
 
 # 官方基线检查点的键：w1/w2 是 MLP 权重，mean/scale 是输入侧标准化，metadata 里带
 # task/paths/classes/target_mean/target_scale。v2 自有格式是 task+coef(+classes)。
+# 官方 metadata 的可选动作通道（v7）：feature_action / feature_action_params 在
+# mean/scale 之前执行，输出替代归一化；feature_action_skip_groups +
+# feature_action_group_pattern 按 raw_id 分组把动作挡在不利分组之外。
 OFFICIAL_KEYS = ("w1", "b1", "w2", "b2", "mean", "scale")
 OFFICIAL_FORBIDDEN = {"truerul", "normalizedrul", "remainingusefullife", "rul", "totalsnapshots"}
 # per_cond_seq 的分组字段（与 train_stage 的 GROUP_KEYS 一致）：工况/设置，不是数据集键。
@@ -407,10 +411,44 @@ def _load_official(archive, key):
                                 % (n_features, paths))
         paths = list(paths)
 
+    # v7 输入动作通道：official 产物的 metadata 可携带 causal 动作，predict 在
+    # mean/scale 归一化**之前**执行它，动作输出直接替代归一化结果。缺省 identity，
+    # 老产物（无该字段）走原路径，逐字节不变。transductive 动作在这里显式拒绝。
+    action_name = meta.get("feature_action", "identity")
+    if not isinstance(action_name, str) or not action_name:
+        raise ContractError("官方 metadata.feature_action 必须是非空字符串")
+    action_params = meta.get("feature_action_params") or {}
+    if isinstance(action_params, str):
+        try:
+            action_params = json.loads(action_params)
+        except ValueError:
+            raise ContractError("官方 metadata.feature_action_params 不是合法 JSON")
+    if not isinstance(action_params, dict):
+        raise ContractError("官方 metadata.feature_action_params 必须是 JSON 对象")
     try:
-        prepared = actions.prepare("identity", {})
+        prepared = actions.prepare(action_name, action_params, stage="predict")
+        identity_act = (prepared if action_name == "identity"
+                        else actions.prepare("identity", {}, stage="predict"))
     except actions.ActionError as exc:
         raise ContractError(str(exc))
+
+    # 分组闸：metadata 只记"动作对哪些分组不利"的名单（纯开关，不含任何统计量）；
+    # 分组键从 predict 可见的 raw_id 里按正则取。名单内、或取不到分组键 → identity，
+    # 这是安全侧：分不清就退回不动作，绝不把不利分组也套上动作。
+    skip_groups = meta.get("feature_action_skip_groups")
+    group_re = None
+    if skip_groups is not None:
+        if (not isinstance(skip_groups, list)
+                or any(not isinstance(item, str) or not item for item in skip_groups)):
+            raise ContractError("官方 metadata.feature_action_skip_groups 应为字符串数组")
+        skip_groups = sorted(set(skip_groups))
+        pattern = meta.get("feature_action_group_pattern")
+        if not isinstance(pattern, str) or not pattern:
+            raise ContractError("给了 feature_action_skip_groups 就必须给 feature_action_group_pattern")
+        try:
+            group_re = re.compile(pattern)
+        except re.error as exc:
+            raise ContractError("feature_action_group_pattern 非法：%s" % exc)
 
     official = {
         "w1": np.ascontiguousarray(w1, dtype=float),
@@ -424,14 +462,19 @@ def _load_official(archive, key):
         "calibration": calibration,
         "hidden": int(w1.shape[1]),
         "paths": paths,
+        "skip_groups": skip_groups,
+        "group_re": group_re,
+        "identity_act": identity_act,
     }
     head = _Head(task, None, None, classes, None, None, "official.paths", n_features,
                  prior_class, (target_mean if task == "regression" else None),
-                 "identity", {}, prepared, format="official", official=official)
+                 action_name, dict(action_params), prepared, format="official",
+                 official=official)
     _CACHE[key] = head
     _STATS["loads"] += 1
-    _note("按官方格式装载检查点：task=%s hidden=%d classes_source=%s"
-          % (task, head.official["hidden"], classes_source))
+    _note("按官方格式装载检查点：task=%s hidden=%d classes_source=%s action=%s%s"
+          % (task, head.official["hidden"], classes_source, action_name,
+             ("（分组闸 %s）" % skip_groups) if skip_groups else ""))
     return head
 
 
@@ -691,8 +734,11 @@ def _resolve_task(sample, head):
     return head.task, "artifact"
 
 
-def _infer_official(head, sample):
-    """官方格式前向：mean/scale 在输入侧，tanh 在单隐层，输出层再接 target_scale/mean。"""
+def _infer_official(head, sample, state):
+    """官方格式前向：动作（缺省 identity）→ 输入侧归一化 → tanh → 输出层。
+
+    动作非 identity 时，它自己的输出就是归一化结果（替代 mean/scale），仍 clip 到 ±10σ。
+    """
     import numpy as np
 
     task, source = _resolve_task(sample, head)
@@ -709,7 +755,26 @@ def _infer_official(head, sample):
         raise ContractError("样本特征维 %d 与检查点期望 %d 不一致"
                             % (vector.size, head.n_features))
 
-    normalized = np.clip((vector - official["mean"]) / official["scale"], -10.0, 10.0)
+    act = head.act
+    skip_groups = official.get("skip_groups")
+    if skip_groups is not None:
+        match = official["group_re"].search(str(getattr(sample, "raw_id", "") or ""))
+        group = None
+        if match is not None:
+            group = match.group(1) if match.groups() else match.group(0)
+        if group is None or group in skip_groups:
+            act = official["identity_act"]
+
+    if act["action"] == "identity":
+        normalized = np.clip((vector - official["mean"]) / official["scale"], -10.0, 10.0)
+        pending = None
+    else:
+        try:
+            vector, pending = act["step"](vector, state, _condition_of(sample))
+        except actions.ActionError as exc:
+            raise ContractError("动作 %s 失败：%s" % (act["action"], exc))
+        normalized = np.clip(np.asarray(vector, dtype=float), -10.0, 10.0)
+
     hidden = np.tanh(normalized @ official["w1"] + official["b1"])
     output = hidden @ official["w2"] + official["b2"]
 
@@ -720,12 +785,12 @@ def _infer_official(head, sample):
             value = calibration["a"] * value + calibration["c"]
         if not math.isfinite(value):
             raise ContractError("回归输出非有限：%r" % value)
-        return {"value": max(0.0, value)}, None
+        return {"value": max(0.0, value)}, pending
 
     scores = _enforce_unique_max(_softmax([float(v) for v in output]), head.classes)
     payload = [{"label": label, "score": float(scores[i])}
                for i, label in enumerate(head.classes)]
-    return payload, None
+    return payload, pending
 
 
 def _infer(head, sample, state):
@@ -733,7 +798,7 @@ def _infer(head, sample, state):
         raise ContractError(sample.invalid)
 
     if head.format == "official":
-        return _infer_official(head, sample)
+        return _infer_official(head, sample, state)
 
     task, source = _resolve_task(sample, head)
     if source == "artifact":

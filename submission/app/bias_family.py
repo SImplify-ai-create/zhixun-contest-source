@@ -7,27 +7,34 @@
 
     候选生成 → 性质测试（llm_cage） → 用当轮切片逐个测量 → 选最优 → 输出侧校准
 
-三条线各自的族（本版只实现 A/C；B 保留关闭）：
+三条线各自的族（本版 A/B/C 全接）：
 
     C（回归）  仿射校准 pred' = a·pred + c，a、c 各自小网格（K=25）。
                依据：δ 扫描显示最优方向随寿命段换号（早段要正、晚段要负），
                病根是预测被压缩向均值——该校的是斜率，不是截距；单常数 δ 有害。
                标量 δ 是 c 的特例，`ScalarDeltaArm` 留作子集。
+    B（回归）  仿射校准 pred' = a·pred + c，斜率取 B_A_GRID，截距由当轮切片的
+               最小二乘解 c = mean(y) − a·mean(pred) 给出（K=8）。
+               依据（2026-11-22 复盘）：B 的验证切片 pred_mean≈383 vs y_mean≈688，
+               corr≈−0.37、父 RMSE 648.55 比"恒等于均值"的 465.5 还差——是输出侧
+               整体漂移，不是 train 侧没学到（train corr 0.955/RMSE 233）。
+               旧口径"B 无校准臂"已作废；B 不是方法无效，是这一类装备被关掉了。
+               约束：平台 predict 要求 a>0，故 a 下界 0.05；|c|≤3·target_scale。
     A（分类）  逐类偏移 b2[c] ← b2[c] + v，一次只动一类（默认关闭，退化为全零）。
-    B          无校准臂（残差方向也随寿命段换号，量级 ±300 分钟），原样放行。
 
 硬约束：
 - **不改 `target_mean` / `target_scale`**（冻结项）。校准参数写进产物 metadata 的
   独立字段 `calibration`，由 `contest_submission._infer_official` 在 predict 时应用。
 - 每轮重新选校准：训练侧写新产物时丢弃父产物的旧 `calibration`（旧斜率对新权重无效）。
 
-跨轮平滑：a 与 c 分别走 EMA（α=0.3），提交用 EMA 值而不是当轮最优。EMA 状态由调用方
-写进 `round_state.json` 的 `bias_ema` 并随账本落盘——跨轮回放必须能逐位复现。
+跨轮平滑：a 与 c 分别走 EMA（α=0.3）。C 提交 EMA 值；B 的提交值改为 4 折折外 RMSE
+最小的候选（2026-11-23 拍板），EMA 只写进记录/对照，不再作为 B 的提交来源。EMA 状态由
+调用方写进 `round_state.json` 的 `bias_ema` 并随账本落盘——跨轮回放必须能逐位复现。
 
 两级兜底（顺序固定）：
 1. 当轮切片不可用（validation 读不出/没有标签）→ 用 a=1, c=0（父产物行为，恒等校准），
    **不用任何历史段的最优常数**；
-2. 候选全被 cage 拒（含最终 EMA 值不过检查）→ 返回 status=parent_fallback，退回父产物。
+2. 候选全被 cage 拒（含最终提交值不过检查）→ 返回 status=parent_fallback，退回父产物。
 
 边界：臂接口（`Arm`）可插拔，但**不实现梯度臂**——"在当轮切片上小步续训"冻结。
 """
@@ -75,7 +82,13 @@ A_GATE = {
                  "漂移尺子的坏模型灵敏度",
                  "A 的计分指标答复"],
 }
-SUPPORTED = ("A", "C")
+SUPPORTED = ("A", "B", "C")
+# B（轴承 RUL）输出侧漂移的校准族：B 的验证切片 pred_mean≈322 vs y_mean≈688，
+# 全局仿射的闭式解 a<0（平台 predict 要求 a>0，故下界取 0.05），c 由各 a 的最小二乘截距给出。
+# 只动 metadata.calibration，不动权重；截距上界按 target_scale 的倍数给（单位是分钟）。
+B_A_GRID = (0.05, 0.10, 0.25, 0.50, 0.75, 1.00, 1.25, 1.50)
+B_A_MIN, B_A_MAX = 0.05, 2.0
+B_C_SCALE_BOUND = 3.0
 # configuration 里最多保留多少条网格得分（K=25 时只记 top-N + 最优，避免撑大回执）。
 GRID_RECORD_MAX = 20
 GRID_KEEP = 12
@@ -139,7 +152,16 @@ class PerClassOffsetArm(Arm):
         return out
 
 
-ARMS = {arm.key: arm for arm in (AffineArm(), PerClassOffsetArm())}
+class BAffineArm(Arm):
+    """B：输出侧仿射校准，截距在拿到当轮切片后按最小二乘补（见 _b_affine_candidates）。"""
+    key = "B"
+    kind = "affine"
+
+    def candidates(self, b2, gate_open=False):
+        return [{"id": "a%.2f" % a, "a": float(a), "c": None} for a in B_A_GRID]
+
+
+ARMS = {arm.key: arm for arm in (AffineArm(), PerClassOffsetArm(), BAffineArm())}
 
 
 # ---------------------------------------------------------------- 工具
@@ -175,13 +197,54 @@ def _gate_open():
     return bool(A_GATE["enabled"]) or os.environ.get(A_GATE["env"]) == "1"
 
 
+def _is_affine(key):
+    """B/C 走同一套输出侧仿射路径；A 仍是逐类 b2 偏移。"""
+    return key in ("B", "C")
+
+
+def _b_affine_candidates(z_val, y_val, arrays, target_mean, target_scale):
+    """B：斜率取网格，截距取当轮切片上的最小二乘解 c = mean(y) − a·mean(pred)。
+
+    额外记 4 折交叉拟合 RMSE：每折只用另外 3 折拟合 c，避免把"同切片拟合并同切片打分"
+    的增益当成可迁移收益。它只进账本，不参与选优。
+    """
+    import numpy as np
+
+    y = np.asarray(y_val, dtype=float)
+    pred = train_mlp._predict(z_val, arrays["w1"], arrays["b1"], arrays["w2"],
+                              arrays["b2"], "regression", target_mean, target_scale)
+    out = []
+    for a in B_A_GRID:
+        c = float(y.mean()) - float(a) * float(pred.mean())
+        out.append({"id": "a%.2f c%+.1f" % (a, c), "a": float(a), "c": float(c),
+                    "cv_rmse": _b_cv_rmse(pred, y, float(a))})
+    return out, pred
+
+
+def _b_cv_rmse(pred, y, a, folds=4):
+    """固定斜率 a，按折重拟合截距，返回折外 RMSE 的均值。"""
+    import numpy as np
+
+    index = np.arange(len(y))
+    np.random.default_rng(20261122).shuffle(index)
+    scores = []
+    for fold in range(folds):
+        test = index[fold::folds]
+        train = np.setdiff1d(index, test)
+        if train.size == 0 or test.size == 0:
+            continue
+        c = float(y[train].mean()) - a * float(pred[train].mean())
+        scores.append(float(np.sqrt(((a * pred[test] + c - y[test]) ** 2).mean())))
+    return float(np.mean(scores)) if scores else None
+
+
 def _prior(previous_state, key):
     """读上一轮 EMA。C 是 (a, c)，A 是逐类偏移向量；缺失/形状不符按恒等起算。"""
     store = (previous_state or {}).get("bias_ema")
     entry = (store or {}).get(key) if isinstance(store, dict) else None
     if not isinstance(entry, dict):
         entry = {}
-    if key == "C":
+    if _is_affine(key):
         try:
             return {"a": float(entry.get("a", 1.0)), "c": float(entry.get("c", 0.0))}
         except (TypeError, ValueError):
@@ -330,7 +393,7 @@ def apply(dataset_key, data_dir, parent_path, prepared, work_dir, round_index,
         record["reason"] = "候选不是可读的官方检查点：%s" % str(exc)[:120]
         return _finish(record, started)
     arrays = ref["arrays"]
-    expected_task = "regression" if key == "C" else "classification"
+    expected_task = "regression" if _is_affine(key) else "classification"
     if ref["task"] != expected_task:
         record["reason"] = "候选任务 %r 与 %s 线不符" % (ref["task"], key)
         return _finish(record, started)
@@ -357,16 +420,27 @@ def apply(dataset_key, data_dir, parent_path, prepared, work_dir, round_index,
         slice_error = "%s: %s" % (type(exc).__name__, str(exc)[:160])
     record["slice"] = {"rows": int(z_val.shape[0]) if z_val is not None else 0,
                        "error": slice_error}
+    import numpy as np
+
+    if key == "B" and z_val is not None:
+        # B 的 c 依赖当轮切片的均值，故在切片可用后补全候选。
+        candidates, b_pred = _b_affine_candidates(z_val, y_val, arrays,
+                                                  target_mean, target_scale)
+        record["K"] = len(candidates)
+        record["b_pred"] = {"mean": _round(float(b_pred.mean())),
+                            "std": _round(float(b_pred.std())),
+                            "y_mean": _round(float(np.asarray(y_val, dtype=float).mean())),
+                            "y_std": _round(float(np.asarray(y_val, dtype=float).std()))}
 
     prior = _prior(previous_state, key)
     record["ema"]["before"] = ({name: _round(value) for name, value in prior.items()}
-                               if key == "C"
+                               if _is_affine(key)
                                else {"offset": [_round(value) for value in prior["offset"]]})
 
     if z_val is None:
         # 第一级兜底：恒等校准，不测量、不更新 EMA。
         record["fallback"] = "identity"
-        chosen = {"a": 1.0, "c": 0.0} if key == "C" else {"delta": [0.0] * int(b2.shape[0])}
+        chosen = {"a": 1.0, "c": 0.0} if _is_affine(key) else {"delta": [0.0] * int(b2.shape[0])}
         record["chosen"] = chosen
         final = _apply_final(record, prepared, arrays, meta, chosen, parent_path,
                              expected_features, round_index, key, source="identity")
@@ -385,7 +459,7 @@ def apply(dataset_key, data_dir, parent_path, prepared, work_dir, round_index,
         shutil.rmtree(scratch)
     ok_items = []
     for index, cand in enumerate(candidates):
-        if key == "C":
+        if _is_affine(key):
             calibration = (cand["a"], cand["c"])
             trial_b2 = b2
             trial_meta = dict(meta)
@@ -406,9 +480,11 @@ def apply(dataset_key, data_dir, parent_path, prepared, work_dir, round_index,
                                          parent_path=parent_path, arm=key)
         entry = {"id": cand["id"], "ok": bool(check["ok"]),
                  "errors": list(check["errors"])[:2]}
-        if key == "C":
+        if _is_affine(key):
             entry["a"] = cand["a"]
             entry["c"] = cand["c"]
+            if cand.get("cv_rmse") is not None:
+                entry["cv_rmse"] = _round(cand["cv_rmse"])
         else:
             nonzero = [i for i, value in enumerate(cand["delta"]) if value]
             entry["class"] = nonzero[0] if nonzero else None
@@ -429,11 +505,13 @@ def apply(dataset_key, data_dir, parent_path, prepared, work_dir, round_index,
         return _finish(record, started)
 
     best = max(ok_items, key=lambda item: item["metrics"]["score"])
-    if key == "C":
+    if _is_affine(key):
         record["best"] = {"id": best["entry"]["id"],
                           "a": _round(best["cand"]["a"]),
                           "c": _round(best["cand"]["c"]),
                           "score": _round(best["metrics"]["score"])}
+        if best["cand"].get("cv_rmse") is not None:
+            record["best"]["cv_rmse"] = _round(best["cand"]["cv_rmse"])
         best_delta = {"a": best["cand"]["a"], "c": best["cand"]["c"]}
     else:
         record["best"] = {"id": best["entry"]["id"],
@@ -441,13 +519,44 @@ def apply(dataset_key, data_dir, parent_path, prepared, work_dir, round_index,
                           "score": _round(best["metrics"]["score"])}
         best_delta = {"delta": list(best["cand"]["delta"])}
 
+    # B 线落盘口径（2026-11-23 拍板）：提交值取 4 折折外 RMSE 最小的候选，
+    # 不再由 EMA 首轮值主导。EMA 仍按上面的 in-sample 最优更新并留痕，只作记录/对照。
+    cv_best = None
+    if key == "B":
+        scored = [item for item in ok_items
+                  if item["cand"].get("cv_rmse") is not None]
+        if scored:
+            cv_best = min(scored, key=lambda item: item["cand"]["cv_rmse"])
+            record["submitted"] = {"id": cv_best["entry"]["id"],
+                                   "a": _round(cv_best["cand"]["a"]),
+                                   "c": _round(cv_best["cand"]["c"]),
+                                   "cv_rmse": _round(cv_best["cand"]["cv_rmse"]),
+                                   "rule": "min_cv_rmse"}
+
     ema_after = _ema_blend(prior, best_delta)
     record["ema"]["after"] = ({name: _round(value) for name, value in ema_after.items()}
-                              if key == "C"
+                              if _is_affine(key)
                               else {"offset": [_round(value) for value in ema_after["offset"]]})
     prev_entry = ((previous_state or {}).get("bias_ema") or {}).get(key)
     rounds = int(prev_entry.get("rounds", 0)) if isinstance(prev_entry, dict) else 0
-    if key == "C":
+    if key == "B":
+        # B 不套 C 的 ±5%/±2 端点（那是 CPU 周期量纲）；只挡非有限，并按 B 自己的
+        # a∈[B_A_MIN,B_A_MAX]、|c|≤B_C_SCALE_BOUND·target_scale 记账。
+        a_raw_b = float(ema_after["a"])
+        c_raw_b = float(ema_after["c"])
+        a_state = a_raw_b if math.isfinite(a_raw_b) else 1.0
+        c_state = c_raw_b if math.isfinite(c_raw_b) else 0.0
+        a_state = min(B_A_MAX, max(B_A_MIN, a_state))
+        c_bound_b = B_C_SCALE_BOUND * abs(float(meta.get("target_scale", 1.0) or 1.0))
+        c_state = min(c_bound_b, max(-c_bound_b, c_state))
+        state = {"a": _round(a_state), "c": _round(c_state)}
+        record["ema"]["state_clamped"] = bool(
+            not math.isfinite(a_raw_b) or not math.isfinite(c_raw_b)
+            or abs(a_state - a_raw_b) > 1e-12 or abs(c_state - c_raw_b) > 1e-12)
+        record["ema"]["state_raw"] = {"a": _json_safe_number(a_raw_b),
+                                      "c": _json_safe_number(c_raw_b)}
+        record["ema"]["bounds"] = {"a": [B_A_MIN, B_A_MAX], "c": _round(c_bound_b)}
+    elif key == "C":
         # 回写钳制后的值：否则"当轮应用 1.05、账本记 1.052995"，下一轮 prior 继续沿
         # 未截断序列爬升。state 必须等于实际生效的值，回放才能逐位复现。
         a_state, a_clamped_state, _, _ = clamp_calibration_a(ema_after["a"])
@@ -461,25 +570,40 @@ def apply(dataset_key, data_dir, parent_path, prepared, work_dir, round_index,
     state["rounds"] = rounds + 1
     record["ema"]["state"] = state
 
-    # 提交 EMA 值；它一般不在网格点上，所以单独过一次 cage。
-    final = _apply_final(record, prepared, arrays, meta, ema_after, parent_path,
-                         expected_features, round_index, key, source="ema")
-    source = "ema"
-    if final is None:
-        # EMA 值被拒：退回当轮最优网格点（它已过 cage）。
-        final = _apply_final(record, prepared, arrays, meta, best_delta,
-                             parent_path, expected_features, round_index, key,
-                             source="best_grid")
-        source = "best_grid"
-        if final is not None:
-            record["fallback"] = "ema_rejected_best_grid"
+    if key == "B" and cv_best is not None:
+        # 提交折外最优（cv）；EMA 不再是提交值来源，只在 record["ema"] 留痕。
+        submit = {"a": cv_best["cand"]["a"], "c": cv_best["cand"]["c"]}
+        final = _apply_final(record, prepared, arrays, meta, submit, parent_path,
+                             expected_features, round_index, key, source="cv")
+        source = "cv"
+        if final is None:
+            # cv 值被 cage 拒：退回当轮 in-sample 最优网格点（它已过 cage）。
+            final = _apply_final(record, prepared, arrays, meta, best_delta,
+                                 parent_path, expected_features, round_index, key,
+                                 source="best_grid")
+            source = "best_grid"
+            if final is not None:
+                record["fallback"] = "cv_rejected_best_grid"
+    else:
+        # C：提交 EMA 值；它一般不在网格点上，所以单独过一次 cage。
+        final = _apply_final(record, prepared, arrays, meta, ema_after, parent_path,
+                             expected_features, round_index, key, source="ema")
+        source = "ema"
+        if final is None:
+            # EMA 值被拒：退回当轮最优网格点（它已过 cage）。
+            final = _apply_final(record, prepared, arrays, meta, best_delta,
+                                 parent_path, expected_features, round_index, key,
+                                 source="best_grid")
+            source = "best_grid"
+            if final is not None:
+                record["fallback"] = "ema_rejected_best_grid"
     if final is None:
         record["status"] = "parent_fallback"
         record["fallback"] = "cage_rejected_final"
         shutil.rmtree(scratch, ignore_errors=True)
         return _finish(record, started)
 
-    if key == "C":
+    if _is_affine(key):
         # chosen 记**实际写入**的值（已过端点），clamp 留痕单列，避免账本出现
         # "写的是 1.05、说的是 1.083877" 的错位。
         applied_c = record.get("chosen_plain") or (
@@ -507,18 +631,51 @@ def _apply_final(record, prepared, arrays, meta, chosen, parent_path,
     path = os.path.join(cand_dir, CHECKPOINT_NAME)
     payload = dict(arrays)
     stamp = dict(meta)
-    if key == "C":
+    scale = float(meta.get("target_scale", 1.0) or 1.0)
+    if not math.isfinite(scale) or scale == 0.0:
+        scale = 1.0
+    if key == "B":
+        # B 用自己的量纲端点：a∈[B_A_MIN,B_A_MAX]（平台 predict 要求 a>0），
+        # |c|≤B_C_SCALE_BOUND·target_scale。不套 C 的 ±5%/±2。
+        a_raw = float(chosen["a"])
+        c_raw = float(chosen["c"])
+        a_value = a_raw if math.isfinite(a_raw) else 1.0
+        c_value = c_raw if math.isfinite(c_raw) else 0.0
+        a_value = min(B_A_MAX, max(B_A_MIN, a_value))
+        c_bound_b = B_C_SCALE_BOUND * abs(scale)
+        c_value = min(c_bound_b, max(-c_bound_b, c_value))
+        sanitized = not (math.isfinite(a_raw) and math.isfinite(c_raw))
+        a_clamped = abs(a_value - a_raw) > 1e-12
+        c_clamped = abs(c_value - c_raw) > 1e-12
+        payload["b2"] = np.asarray(arrays["b2"], dtype=float)
+        stamp["calibration"] = {"a": a_value, "c": c_value, "source": source,
+                                "alpha": EMA_ALPHA, "round": int(round_index),
+                                "clamped": bool(a_clamped),
+                                "c_clamped": bool(c_clamped),
+                                "sanitized": sanitized,
+                                "bounds": "B",
+                                "c_abs_over_scale": _round(abs(c_value) / abs(scale))}
+        if a_clamped or sanitized:
+            stamp["calibration"]["a_before_clamp"] = _json_safe_number(a_raw)
+        if c_clamped or sanitized:
+            stamp["calibration"]["c_before"] = _json_safe_number(c_raw)
+        applied = abs(a_value - 1.0) > 1e-12 or abs(c_value) > 1e-12
+        record["chosen_plain"] = {"a": a_value, "c": c_value}
+        record["clamp"] = {"clamped": bool(a_clamped),
+                           "c_clamped": bool(c_clamped),
+                           "sanitized": sanitized,
+                           "a_after": _round(a_value),
+                           "a_before": _json_safe_number(a_raw),
+                           "c_after": _round(c_value),
+                           "c_before": _json_safe_number(c_raw),
+                           "c_abs_over_scale": _round(abs(c_value) / abs(scale))}
+    elif key == "C":
         # v7：a 走端点（|a−1| ≤ C_A_BOUND）。截断后的值才是写进 metadata 与账本的值；
         # 截断前原值只在这条留痕里（a_before_clamp），EMA 的 α 与网格都不动。
-        # 非有限值（NaN/±inf）单独记 sanitized：它不参与区间比较，替换成恒等值 1.0，
-        # 不能和"越界被压回"共用一个 clamped=true。
         a_value, a_clamped, a_sanitized, a_raw = clamp_calibration_a(chosen["a"])
         c_raw = float(chosen["c"])
         c_value, c_clamped, c_sanitized, _c_raw = clamp_calibration_c(c_raw)
         sanitized = bool(a_sanitized or c_sanitized)
-        scale = float(meta.get("target_scale", 1.0) or 1.0)
-        if not math.isfinite(scale) or scale == 0.0:
-            scale = 1.0
         payload["b2"] = np.asarray(arrays["b2"], dtype=float)
         stamp["calibration"] = {"a": a_value, "c": c_value, "source": source,
                                 "alpha": EMA_ALPHA, "round": int(round_index),
@@ -568,7 +725,7 @@ def _apply_final(record, prepared, arrays, meta, chosen, parent_path,
     prepared["built"]["sha256"] = train_mlp._sha256_file(path)
     prepared["built"]["trained_sha256"] = record["source_sha256"]
     prepared["built"]["bias"] = record
-    if key == "C":
+    if _is_affine(key):
         prepared["built"]["calibrated"] = True
         prepared["built"]["calibration"] = record["chosen_plain"]
     else:
@@ -605,5 +762,5 @@ def compact(record):
         return None
     return {name: record.get(name) for name in
             ("arm", "kind", "status", "applied", "uploaded", "upload_note",
-             "fallback", "best", "chosen", "clamp",
+             "fallback", "best", "chosen", "submitted", "clamp",
              "ema", "K", "slice") if name in record}

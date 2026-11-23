@@ -52,10 +52,12 @@ SCRIPT_OUTPUT_CAP = 64 * 1024
 HYPOTHESIS_MAX = 200
 KILL_MAX = 200
 DIGITS = re.compile(r"[0-9]")
-# 数字白名单按"完整数字 token"比较，不做子串剥离：允许的只是平台帧给定的轮次号，
-# 模型自产的 0.02 / 3.5 / 123 仍是越界 token。
-NUMBER_TOKEN = re.compile(r"\d+(?:\.\d+)?")
-LEDGER_REF = re.compile(r"(?:round|ledger|h|H)[-_]?\d+|[A-Za-z]+-\d+")
+# 数字白名单按"完整数字 token"比较，不做子串剥离：允许的是平台输入里出现过的数值
+# （状态卡实测值、账本分数、当轮轮次号）与本提案自己的参数值；凭空编造的
+# 0.02 / 3.5 / 123 仍是越界 token。token 支持科学计数法，避免 1e-6 被拆成 1 和 6。
+NUMBER_TOKEN = re.compile(r"\d+(?:\.\d+)?(?:[eE][-+]?\d+)?")
+# 引用账本行：英文 round-3 / h-2 / A-3，以及中文“第3轮”“第 3 轮”。
+LEDGER_REF = re.compile(r"(?:round|ledger|h|H)[-_]?\d+|[A-Za-z]+-\d+|第\s*\d+\s*轮")
 NO_HISTORY_PHRASES = (
     "账本为空",
     "无历史",
@@ -444,13 +446,74 @@ def _strip_refs(text, history_ids):
     return LEDGER_REF.sub("", out)
 
 
-def _allowed_digits(context):
-    """有界白名单：只允许平台帧给出的当轮轮次号，绝不从模型文本里取。"""
+def _numeric_values(text):
+    values = []
+    for token in NUMBER_TOKEN.findall(str(text or "")):
+        try:
+            values.append(float(token))
+        except ValueError:
+            continue
+    return values
+
+
+def frame_numbers(messages):
+    """从真正发给模型的提示词里抽数值，作为数字白名单的唯一来源。
+
+    状态卡、检测器读数、账本分数都在提示词里；模型复述它们属于合法引用。
+    调用方在 review 前把结果放进 context["numeric_frame"]。
+    """
+    texts = []
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            texts.append(content)
+        elif content is not None:
+            texts.append(json.dumps(content, ensure_ascii=False))
+    return _numeric_values("\n".join(texts))
+
+
+def _allowed_digits(context, extra_values=()):
+    """平台输入里出现过的数值 + 本提案自己的参数值。
+
+    原实现只放行当轮轮次号，模型在 hypothesis 里复述状态卡实测值
+    （rmse / KL / bbsd）或自己刚填的 alpha·eps 都被判越界。
+    这里只认“能在输入里找到原值”的数：整数 token 与参考值的整数部分
+    相等即可（6317 ≈ 6317.0056），小数 token 允许按自身精度四舍五入后
+    相等（51.88 ≈ 51.8809）。输入里找不到的数值（例如凭空写 9999）仍然拒收。
+    """
+    allowed = set(_numeric_values(json.dumps(context or {}, ensure_ascii=False,
+                                           sort_keys=True)))
+    allowed.update(_numeric_values(context and context.get("numeric_frame")))
     try:
-        round_index = int((context or {}).get("round_index"))
+        allowed.add(float(int((context or {}).get("round_index"))))
     except (TypeError, ValueError):
-        return set()
-    return {str(round_index)}
+        pass
+    for value in extra_values:
+        try:
+            allowed.add(float(value))
+        except (TypeError, ValueError):
+            continue
+    return allowed
+
+
+def _is_allowed_number(token, allowed):
+    try:
+        value = float(token)
+    except (TypeError, ValueError):
+        return False
+    mantissa = re.split(r"[eE]", str(token))[0]
+    decimals = len(mantissa.split(".")[1]) if "." in mantissa else 0
+    for ref in allowed:
+        if value == ref:
+            return True
+        if decimals:
+            if abs(value - ref) <= 0.5 * (10.0 ** -decimals):
+                return True
+        elif int(abs(ref)) == value:
+            return True
+    return False
 
 
 def validate_proposal(proposal, context):
@@ -468,14 +531,13 @@ def validate_proposal(proposal, context):
         raise CageError("hypothesis 不能为空，且必须点名引用账本行")
     if len(hypothesis) > HYPOTHESIS_MAX:
         raise CageError("hypothesis 超过 %d 字：%d" % (HYPOTHESIS_MAX, len(hypothesis)))
-    allowed = _allowed_digits(context)
+    allowed = _allowed_digits(context, list(params.values()))
     tokens = NUMBER_TOKEN.findall(_strip_refs(hypothesis,
                                               list(context.get("history_ids") or [])))
-    offenders = [token for token in tokens if token not in allowed]
+    offenders = [token for token in tokens if not _is_allowed_number(token, allowed)]
     if offenders:
-        raise CageError("hypothesis 不得出现数字（数字只能来自平台回执）；"
-                        "本轮白名单=%s，越界=%s：%r"
-                        % (sorted(allowed) or "空", offenders, hypothesis))
+        raise CageError("hypothesis 不得出现数字（数字只能来自平台输入或本提案参数）；"
+                        "越界=%s：%r" % (offenders, hypothesis))
     if not _cites_ledger(hypothesis, list(context.get("history_ids") or [])):
         raise CageError("hypothesis 未点名引用账本行：%r" % hypothesis)
 
@@ -541,9 +603,9 @@ def review(text, context):
         "proposal_arm_raw": (proposal or {}).get("arm"),
         "failure_kind": ("none" if accepted is not None else classify_failure(errors)),
         "auditable": bool((text or "").strip()),
-        # 数字白名单的来源与取值：来源固定是平台帧，取值只含当轮轮次号。
-        "allowed_digits": sorted(_allowed_digits(context)),
-        "allowed_digits_source": "round_frame",
+        # 数字白名单的来源与取值：平台输入里出现过的数值 + 本提案参数（截断展示）。
+        "allowed_digits": sorted(_allowed_digits(context))[:50],
+        "allowed_digits_source": "platform_input_and_proposal_params",
     }
 
 

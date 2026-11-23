@@ -25,6 +25,7 @@
     C（未见稳定漂移）    只重解输出层（分类走 Adam 头、回归走岭回归闭式解）
 """
 
+import collections
 import json
 import math
 import os
@@ -204,23 +205,29 @@ def _read_rows(path):
 
 
 def _extract(rows, shape, n_features, label_fn):
-    """按固定结构抽 X/y；结构不符或缺标签的行整行跳过并计数。"""
+    """按固定结构抽 X/y；结构不符或缺标签的行整行跳过并计数。
+
+    v7.2 工程优化：用 `train_stage._collect_sig` 一次遍历同时校验结构与收集数值，
+    替代原先 `_shape_of` + `_collect` 两遍走；坏行仍按"先结构、后数值"的旧口径归类。
+    """
     import numpy as np
 
     kept_x, kept_y, stats = [], [], {"rows": len(rows), "bad_shape": 0,
                                      "bad_label": 0, "bad_value": 0}
     for row in rows:
         inputs = row["inputs"]
+        values = []
         try:
-            if _shape_of(inputs) != shape:
-                stats["bad_shape"] += 1
-                continue
-            values = []
-            _collect(inputs, values)
+            signature = train_stage._collect_sig(inputs, values)
         except (TypeError, ValueError, OverflowError):
-            stats["bad_value"] += 1
+            # 旧实现先算 _shape_of：结构不符计 bad_shape，结构对了但数值坏计 bad_value。
+            try:
+                mismatch = _shape_of(inputs) != shape
+            except (TypeError, ValueError):
+                mismatch = False
+            stats["bad_shape" if mismatch else "bad_value"] += 1
             continue
-        if len(values) != n_features:
+        if signature != shape or len(values) != n_features:
             stats["bad_shape"] += 1
             continue
         target = label_fn(row)
@@ -233,7 +240,7 @@ def _extract(rows, shape, n_features, label_fn):
     return x, kept_y, stats
 
 
-def _load_dataset(data_dir, paths, classes, task):
+def _load_dataset_uncached(data_dir, paths, classes, task):
     """读 train/validation，返回 (x_train, y_train, x_val, y_val, stats)。"""
     n_features = len(paths)
     train_rows, train_bad = _read_rows(os.path.join(data_dir, TRAIN_NAME))
@@ -277,6 +284,34 @@ def _load_dataset(data_dir, paths, classes, task):
         "train": s_train, "val": s_val,
     }
     return x_train, y_train, x_val, y_val, stats
+
+
+# v7.2 工程优化：同一轮内 finetune 会被调用多次（选中臂 + 四臂同尺的对照臂），
+# 数据完全相同时没必要重复"解析 JSONL + 逐行展开"。键里带文件 mtime/ctime/size，
+# 数据一换即失效；只缓存只读的 X/y（返回给调用方的 y 是 list，会被各调用方转成新数组）。
+_LOAD_CACHE = collections.OrderedDict()
+_LOAD_CACHE_MAX = 3
+
+
+def _load_dataset(data_dir, paths, classes, task):
+    """`_load_dataset_uncached` 的进程内缓存层：输入相同则复用同一份 X/y。"""
+    train_path = os.path.join(data_dir, TRAIN_NAME)
+    val_path = os.path.join(data_dir, VAL_NAME)
+    key = None
+    if os.path.isfile(train_path) and os.path.isfile(val_path):
+        key = (train_stage.file_key(train_path), train_stage.file_key(val_path),
+               tuple(paths), tuple(str(name) for name in classes), task)
+        hit = _LOAD_CACHE.get(key)
+        if hit is not None:
+            _LOAD_CACHE.move_to_end(key)
+            x_train, y_train, x_val, y_val, stats = hit
+            return x_train, y_train, x_val, y_val, dict(stats)
+    value = _load_dataset_uncached(data_dir, paths, classes, task)
+    if key is not None:
+        _LOAD_CACHE[key] = value
+        while len(_LOAD_CACHE) > _LOAD_CACHE_MAX:
+            _LOAD_CACHE.popitem(last=False)
+    return value
 
 
 # ---------------------------------------------------------------- 模型
@@ -497,7 +532,7 @@ def weight_rel_cap(arm=None):
     return value
 
 
-def load_yardstick(data_dir, reference_path):
+def _load_yardstick_uncached(data_dir, reference_path):
     """按参照检查点的 schema 只读 validation.jsonl（历史最优回投的固定标尺）。
 
     返回 (z_val, y_val, task)。只读 validation 不读 train：C 线 train.jsonl 38 MB，
@@ -561,6 +596,30 @@ def load_yardstick(data_dir, reference_path):
     if task == "classification":
         return z_val, np.asarray(y_val, dtype=np.int64), task
     return z_val, np.asarray(y_val, dtype=float), task
+
+
+# v7.2 工程优化：一轮里 bias_family / 四臂同尺 / 局部最优回投都用同一父产物读同一份
+# validation.jsonl，标尺完全一致。按 (validation 身份, 参照产物身份) 复用，数据换即失效。
+_YARD_CACHE = collections.OrderedDict()
+_YARD_CACHE_MAX = 2
+
+
+def load_yardstick(data_dir, reference_path):
+    """`_load_yardstick_uncached` 的进程内缓存层：同一标尺不重复解析。"""
+    val_path = os.path.join(data_dir, VAL_NAME)
+    key = None
+    if os.path.isfile(val_path) and os.path.isfile(reference_path):
+        key = (train_stage.file_key(val_path), train_stage.file_key(reference_path))
+        hit = _YARD_CACHE.get(key)
+        if hit is not None:
+            _YARD_CACHE.move_to_end(key)
+            return hit
+    value = _load_yardstick_uncached(data_dir, reference_path)
+    if key is not None:
+        _YARD_CACHE[key] = value
+        while len(_YARD_CACHE) > _YARD_CACHE_MAX:
+            _YARD_CACHE.popitem(last=False)
+    return value
 
 
 def _calibration_of(meta, task):
@@ -800,10 +859,11 @@ def finetune(parent_path, out_dir, data_dir, arm="A", round_index=1, params=None
     profile = dict(ARM_PROFILES.get(arm) or ARM_PROFILES["A"])
     profile.update({key: params[key] for key in ("scope", "epochs", "lr_multiplier")
                     if key in params})
-    # v5 步幅衰减表：后段轮次压 epochs / lr。表值优先于臂 profile；
+    # v5 步幅衰减表：后段轮次压 lr；B 线不再被表覆盖（epochs 与 lr 都保留臂 profile），
+    # 避免"表里 2 轮/0.5 倍 < 臂 profile 3 轮/1.0 倍"把唯一有效的训练配置切短。
     # 环境变量（CONTEST_TRAIN_EPOCHS / CONTEST_TRAIN_LR_MULT）仍可覆盖，供离线实验。
     plan = step_plan(arm, round_index)
-    if plan:
+    if plan and str(dataset_key or "") != "B":
         profile["epochs"] = plan["epochs"]
         profile["lr_multiplier"] = plan["lr_multiplier"]
     if profile["scope"] not in ("all", "head"):
@@ -967,7 +1027,9 @@ def finetune(parent_path, out_dir, data_dir, arm="A", round_index=1, params=None
                 status, reason, chosen_lambda = "aborted_deadline", "标定探针撞上时间上限，回退 λ=0", 0.0
             else:
                 chosen_lambda = float(calibration["lambda"])
-                status = "active"
+                # 只有真的启用锚定才算 active；未触发/退化回退都记 not_triggered，
+                # 否则账本会把"λ=0 没介入"读成"锚在工作"。
+                status = "active" if calibration["triggered"] else "not_triggered"
                 reason = calibration.get("reason")
                 l2sp_report.update({
                     "triggered": bool(calibration["triggered"]),
@@ -1039,7 +1101,15 @@ def finetune(parent_path, out_dir, data_dir, arm="A", round_index=1, params=None
         if sha16 and sha16 != parent_sha16_hint and sha16 not in history_after:
             history_after.append(sha16)
     soup_skip = None
-    if (parent["task"] == "regression" and weights_changed
+    # v7 J1b：keep 守卫把父权重留下时，soup 仍以"本轮训练终点"为端点。
+    # 否则 submitted 与父逐字节相同，插值退化，历史对也永远看不到训练方向。
+    soup_endpoint = submitted if weights_changed else final
+    endpoint_source = "submitted" if weights_changed else "final"
+    soup_endpoint_moved = any(
+        not np.array_equal(np.asarray(soup_endpoint[name], dtype=float),
+                           np.asarray(parent["arrays"][name], dtype=float))
+        for name in ("w1", "b1", "w2", "b2"))
+    if (parent["task"] == "regression" and soup_endpoint_moved
             and os.environ.get(ENV_SOUP, "1") != "0"):
         # 资格线必须与最终候选自检同源：check_candidate 用的是 dataset_key（线），
         # 不是本轮选中的适应臂。此前用 arm，B/C 线回退到 A 臂时会把上限放宽成 A 的
@@ -1058,9 +1128,9 @@ def finetune(parent_path, out_dir, data_dir, arm="A", round_index=1, params=None
         is_c = (str(dataset_key or "") == "C")
         variants = []
         parent_sha16 = _sha256_file(parent_path)[:16]
-        trained_sha16 = _sha256_arrays(submitted)
+        trained_sha16 = _sha256_arrays(soup_endpoint)
         for alpha in SOUP_GRID:
-            variant = {name: parent_arrays[name] + alpha * (submitted[name] - parent_arrays[name])
+            variant = {name: parent_arrays[name] + alpha * (soup_endpoint[name] - parent_arrays[name])
                        for name in ("w1", "b1", "w2", "b2")}
             rel = concat_rel_l2(variant, parent["arrays"])
             pred_v = _predict(z_val, variant["w1"], variant["b1"], variant["w2"],
@@ -1103,6 +1173,7 @@ def finetune(parent_path, out_dir, data_dir, arm="A", round_index=1, params=None
         chosen_v = min(eligible, key=lambda item: item["rmse"]) if eligible else None
         if chosen_v is not None and chosen_v["rmse"] < parent_metric - 1e-12:
             submitted = chosen_v["weights"]
+            weights_changed = True
         else:
             # 没有任何过闸门的插值比父产物好：逐字节退回父权重（与 keep_guard 同口径）
             submitted = {name: parent_arrays[name].copy() for name in parent_arrays}
@@ -1132,6 +1203,8 @@ def finetune(parent_path, out_dir, data_dir, arm="A", round_index=1, params=None
                                            else "lineage_gate")),
                      "n_variants": len(variants),
                      "n_eligible": len(eligible),
+                     "endpoint": endpoint_source,
+                     "endpoint_rel_l2": concat_rel_l2(soup_endpoint, parent["arrays"]),
                      "note": " Adam 矩与步数对应训练端点；α<1 时权重为插值" }
         # δ 偏置：只在 C 线、候选仍保留时。约束 RMSE 升幅 ≤1% 下最小化 NAS。
         if nas_on and weights_changed and chosen_v is not None:
@@ -1161,6 +1234,8 @@ def finetune(parent_path, out_dir, data_dir, arm="A", round_index=1, params=None
     if soup_info is None:
         if parent["task"] != "regression":
             reason = "not_regression"
+        elif not soup_endpoint_moved:
+            reason = "endpoint_equal_parent"
         elif not weights_changed:
             reason = "weights_changed_false"
         elif os.environ.get(ENV_SOUP, "1") == "0":
@@ -1285,6 +1360,29 @@ def finetune(parent_path, out_dir, data_dir, arm="A", round_index=1, params=None
         _assert_saved_state(checkpoint_path, submitted, final_moments, meta["steps"])
         report["artifact"] = "retrained"
         report["adam"] = {"steps": int(steps_run), "saved": True}
+    # v7 J1c：父权重被 keep 守卫留下时，把本轮训练终点另存为历史端点候选，
+    # 避免"每轮上传都是父副本 → 历史端点同 sha 去重只剩一条"。该文件不上传。
+    if parent["task"] == "regression" and not weights_changed and soup_endpoint_moved:
+        endpoint_path = os.path.join(out_dir, "trained-endpoint.npz")
+        arrays = {name: parent["arrays"][name] for name in parent["arrays"]}
+        for name in ("w1", "b1", "w2", "b2"):
+            arrays[name] = np.ascontiguousarray(soup_endpoint[name], dtype=float)
+        endpoint_meta = dict(parent["meta"])
+        endpoint_meta.pop("calibration", None)
+        endpoint_meta["endpoint"] = {
+            "round": int(round_index), "selection": selection,
+            "val": {"metric": metric_name, "parent": parent_metric,
+                    "final": (history[-1].get("val") if history else None)},
+            "rel_l2": (soup_info or {}).get("endpoint_rel_l2"),
+            "note": "trained endpoint not submitted; history candidate",
+        }
+        arrays["metadata"] = np.array(json.dumps(endpoint_meta, ensure_ascii=False,
+                                                 sort_keys=True))
+        np.savez(endpoint_path, **arrays)
+        report["trained_endpoint"] = {
+            "path": endpoint_path, "sha256": _sha256_file(endpoint_path),
+            "rel_l2": (soup_info or {}).get("endpoint_rel_l2"),
+        }
     with open(os.path.join(out_dir, REPORT_NAME), "w", encoding="utf-8",
               newline="\n") as handle:
         json.dump(report, handle, ensure_ascii=False, indent=1, sort_keys=True)
@@ -1384,17 +1482,16 @@ def _history_pair_specs(parent, parent_path, history):
 
 
 def _endpoint_rel_l2(weights, start):
-    """本轮训练端点相对起点的位移：逐张量 rel_l2 取最大（与权重闸门同口径）。"""
-    import numpy as np
+    """本轮训练端点相对起点的位移：与权重闸门同口径的拼接 rel_l2。
 
-    worst = 0.0
-    for name in ("w1", "b1", "w2", "b2"):
-        current = np.asarray(weights[name], dtype=float)
-        base = np.asarray(start[name], dtype=float)
-        denom = float(np.linalg.norm(base))
-        if denom:
-            worst = max(worst, float(np.linalg.norm(current - base)) / denom)
-    return worst
+    2026-11-22 修正：原实现是"逐张量 rel_l2 取最大"，注释虽写"与权重闸门同口径"
+    却不成立——闸门与账本用的是 concat_rel_l2（拼接向量 ‖Δ‖/‖父‖），逐张量 max
+    恒 ≥ 拼接值。d_target=0.15 是按闸门的拼接读数（最坏 0.1332）登记的，两把尺子
+    混用会让 L2-SP 触发判定落在目标带从未标定过的区间里（b2 单张量 0.275 就能把
+    d0 顶到 0.27，而闸门看到的是 0.084）。
+    """
+    rel = concat_rel_l2(weights, start)
+    return 0.0 if rel is None else float(rel)
 
 
 def _l2sp_d_target(params, arm):

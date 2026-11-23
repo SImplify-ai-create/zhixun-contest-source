@@ -449,6 +449,80 @@
    "id": "C4-calibration-2026-11-22.v3",
    "sha256": "1735103a58da8ef83dc6a9a68e37cadc1af4d49edf3c498d5e620b9bbf4e5005",
    "status": "pending_activation"
+  },
+  {
+   "canonical": "json/utf-8/sort_keys/indent=1",
+   "content": {
+    "appended_after_implementation": true,
+    "appended_note": "接管代码先落地、本条后补登；触发条件与闸门按已实现代码写，未回改任何阈值或既有条目。",
+    "date": "2026-11-22",
+    "evidence": {
+     "R1": {
+      "best": "C",
+      "best_value": 648.082813,
+      "chosen": "A",
+      "chosen_value": 656.351785,
+      "delta_rmse": 8.268972
+     },
+     "R2": {
+      "best": "B",
+      "best_value": 647.966798,
+      "chosen": "A",
+      "chosen_value": 648.55386,
+      "delta_rmse": 0.587062
+     },
+     "counterfactual_note": "R1/R2 是各自独立的单轮反事实，不是顺序模拟",
+     "ledger": "f1-receipt/work/f1-line-B.txt（官方回执，30 轮训练账本）"
+    },
+    "gates": {
+     "cooldown": "pessimism.cooldown[arm] == 0",
+     "no_threshold_change": true,
+     "pessimistic_bound": "arm bound >= parent bound（任一缺失则跳过该比较）",
+     "prepare": {
+      "budget": "候选体积/数量预算",
+      "candidate_check": "features/action/文件数与体积；权重位移 cap 与既有口径同源（A/B rel_l2 0.1；C 线按 v3 预测位移 0.11）",
+      "red_team": "5 条确定性红队问题；fallback 路径本来就不跑模型红队，接管与它同口径"
+     },
+     "state_gate": "llm_cage.state_gate：final_round / unseen_signature 等原判定"
+    },
+    "id": "arm-takeover-2026-11-22.v1",
+    "implementation": {
+     "call_site": "train_round.py：_score_arms 之后、bias_family 之前",
+     "selector": "selector.best_scored_arm / selector.best_arm_delta"
+    },
+    "purpose": "四臂同尺评分后，把载荷从规则臂接管到严格更优、且能过全套闸门的真实新候选。",
+    "scope": {
+     "dataset_key": [
+      "B",
+      "C"
+     ],
+     "layer": "载荷接管（与 _apply_local_best 同层），不改变 selector.select() 的方案臂",
+     "policy": [
+      "fallback_rule"
+     ]
+    },
+    "selection_statistics": {
+     "not_used_for": "训练配方/超参选择；不改变 C4 折内均值选择统计",
+     "rule_selector_unchanged": "selector.select() 仍先按 train 侧检测器出方案臂（验证盲）",
+     "takeover_input": "同一轮已构建四臂、同一份验证切片的评分表"
+    },
+    "trigger": {
+     "chosen_not_parent": true,
+     "dataset_key_in": [
+      "B",
+      "C"
+     ],
+     "exclude_parent": true,
+     "fallback_only": true,
+     "real_new_candidate": "arm.changed != false（changed=false 等价父副本，不接管）",
+     "strictly_better": "rmse: best < chosen - 1e-12；macro_f1: best > chosen + 1e-12",
+     "tie": "平局不接管"
+    }
+   },
+   "date": "2026-11-22",
+   "hash_of": "content",
+   "id": "arm-takeover-2026-11-22.v1",
+   "sha256": "e4702a9702b0e716499013fa38926b59c67953ed991d24813894c7a190210bbc"
   }
  ],
  "schema": "contest.v7.preregistration"

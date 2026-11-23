@@ -37,6 +37,7 @@
 候选目录名由内容摘要决定，模型调用固定 `temperature=0`。
 """
 
+import collections
 import hashlib
 import json
 import math
@@ -56,6 +57,7 @@ import train_mlp  # noqa: E402
 import llm_cage  # noqa: E402
 import bias_family  # noqa: E402
 import failure_modes  # noqa: E402
+import actions  # noqa: E402  输入动作（causal/transductive 门禁与逐行 step）
 from v6alpha import alpha_lib as _alpha_lib  # noqa: E402  v6 纯函数库（原样复用）
 from v6alpha import grid_serialize as _grid_serialize  # noqa: E402
 
@@ -691,13 +693,13 @@ def _budget(cand_dir, cap=SIZE_CAP):
 
 
 def _score_arms(parent, data_dir, round_index, dataset_key, work, chosen, prepared):
-    """每轮把四个臂都构造出来，在**同一份**验证切片上各打一次分，只记录、不选臂。
+    """每轮把四个臂都构造出来，在**同一份**验证切片上各打一次分；本函数只评分。
 
     这是四臂实验的原始数据：模型选 / 规则选 / 实际最优必须来自同一把尺子，
-    所以这里不读平台回执、不重跑第二轮，只做一次固定标尺评分。选臂逻辑仍在
-    上游，本函数不改变本轮提交决策（胜负表出来前 allow_takeover 不打开）。
+    所以这里不读平台回执、不重跑第二轮，只做一次固定标尺评分。评分完成后的
+    载荷接管在调用方（只对规则兜底的 B/C 回归轮、且须再过同一组闸门）。
 
-    已构建的本轮候选（含输出侧校准）直接复用，避免重复训练；其余臂在
+    已构建的本轮候选直接复用，避免重复训练；其余臂在
     `round-<n>/arm-scores/<arm>/` 下单独构建。任一臂失败只记该臂 error，不拖垮整轮。
     """
     root = os.path.join(work, "round-%s" % round_index, "arm-scores")
@@ -708,10 +710,12 @@ def _score_arms(parent, data_dir, round_index, dataset_key, work, chosen, prepar
         z_val, y_val, task = train_mlp.load_yardstick(data_dir, parent["path"])
     except Exception as exc:  # noqa: BLE001 - 标尺不可用就如实记，不伪造分数
         return {"slice": {"error": "%s: %s" % (type(exc).__name__, str(exc)[:160])},
-                "arms": {}, "best": None, "chosen": chosen, "chosen_is_best": None}
+                "arms": {}, "best": None, "chosen": chosen, "chosen_is_best": None,
+                "best_candidates": [], "best_tied": None}
     metric = "macro_f1" if task == "classification" else "rmse"
     record = {"slice": {"rows": int(z_val.shape[0]), "metric": metric},
-              "arms": {}, "best": None, "chosen": chosen, "chosen_is_best": None}
+              "arms": {}, "best": None, "chosen": chosen, "chosen_is_best": None,
+              "best_candidates": [], "best_tied": None}
     scores = {}
     for arm in (PARENT,) + CANDIDATE_IDS:
         if arm == chosen:
@@ -750,9 +754,17 @@ def _score_arms(parent, data_dir, round_index, dataset_key, work, chosen, prepar
         }
         scores[arm] = value if metric == "macro_f1" else -value
     if scores:
-        best = max(scores, key=lambda name: (scores[name], name))
-        record["best"] = best
-        record["chosen_is_best"] = bool(best == chosen)
+        # 平局语义：等分不靠字典序定胜负。按账本落账精度（6 位小数）取最优集合；
+        # 多于一个臂并列最优时记 "TIE"，避免 PARENT 仅凭名字顺序被记成严格最优。
+        recorded = {arm: record["arms"][arm]["value"] for arm in scores}
+        best_value = (max if metric == "macro_f1" else min)(recorded.values())
+        best_candidates = sorted(arm for arm, v in recorded.items()
+                                 if v == best_value)
+        record["best_candidates"] = best_candidates
+        record["best_tied"] = len(best_candidates) > 1
+        record["best"] = "TIE" if record["best_tied"] else best_candidates[0]
+        record["chosen_is_best"] = bool(not record["best_tied"]
+                                        and record["best"] == chosen)
     return record
 
 
@@ -809,7 +821,12 @@ def _r10_family(prepared, history, parent, data_dir, round_index, dataset_key,
             continue
         if not os.path.isfile(entry.get("path") or ""):
             continue
-        endpoints.append({"id": "R%s" % entry.get("round"),
+        # 同一轮可能有两份端点（上传载荷 + 训练终点，sha 不同）；族内 id 必须唯一，
+        # 否则 P-R3 会出现两对、scores 长度与 alphas 对不上，alpha_grid 直接抛错。
+        ident = "R%s" % entry.get("round")
+        if any(item["id"] == ident for item in endpoints):
+            ident = "%s-%s" % (ident, sha[:4])
+        endpoints.append({"id": ident,
                           "round": entry.get("round"), "path": entry["path"],
                           "sha256": sha, "role": "history"})
         if len(endpoints) >= 3:
@@ -846,10 +863,45 @@ def _r10_family(prepared, history, parent, data_dir, round_index, dataset_key,
         # 只制造重复分数与假并列，直接剔除；parent 的分数已由各对端点覆盖。
         specs = [item for item in specs if item[1]["sha256"] != item[2]["sha256"]]
 
+    # 权重与父逐字节相同、只有 metadata.calibration 不同的载荷：α<1 的插值会走
+    # alpha_lib._merge_metadata，把 calibration 当作"换权重后失效"丢掉；但这里权重
+    # 根本没换，丢掉的恰是唯一有效的校准（B 的校准载荷就是这种：权重=父、只有校准）。
+    # 这类对只保留 α=1（端点本身参与同场打分），α<1 不生成，并在 ledger 的
+    # soup_excluded 里记明原因。
+    degenerate_ids = set()
+    soup_excluded = []
+    if task != "classification":
+        import numpy as np  # noqa: E402 - 只在这一段比权重，避免顶层强依赖
+
+        def _model_arrays(entry):
+            try:
+                return train_mlp._load_parent(entry["path"])["arrays"]
+            except Exception:  # noqa: BLE001 - 读不出就按原路径处理
+                return None
+
+        for spec in specs:
+            left, right = spec[1], spec[2]
+            left_arrays, right_arrays = _model_arrays(left), _model_arrays(right)
+            same_weights = bool(
+                left_arrays is not None and right_arrays is not None
+                and all(left_arrays[name].shape == right_arrays[name].shape
+                        and np.array_equal(left_arrays[name], right_arrays[name])
+                        for name in ("w1", "b1", "w2", "b2", "mean", "scale")
+                        if name in left_arrays and name in right_arrays))
+            if same_weights and left["sha256"] != right["sha256"]:
+                degenerate_ids.add(spec[0])
+                soup_excluded.append({
+                    "pair": spec[0],
+                    "reason": "weights_equal_parent_only_calibration_differs",
+                    "a": left["sha256"][:16], "b": right["sha256"][:16]})
+
     interp_dir = os.path.join(work, "round-%s" % int(round_index), "family")
     cells = []
     for pair_id, left, right in specs:
         for alpha in alphas:
+            if pair_id in degenerate_ids and 0.0 < float(alpha) < 1.0:
+                # 见上：权重相同、只差校准的对不生成插值格，避免把校准静默抹掉。
+                continue
             cell = {"pair": pair_id, "alpha": float(alpha),
                     "endpoints": [left["sha256"][:16], right["sha256"][:16]]}
             try:
@@ -929,7 +981,7 @@ def _r10_family(prepared, history, parent, data_dir, round_index, dataset_key,
                 if isinstance(row.get("rel_l2"), (int, float))]
         pairs.append({"id": pair_id, "a": left["sha256"][:16],
                       "b": right["sha256"][:16], "scores": scores,
-                      "scores_raw": raws, "sel": float(alphas[best_at]),
+                      "scores_raw": raws, "sel": float(rows[best_at]["alpha"]),
                       "endpoints_rel": (round(max(rels), 6) if rels else None)})
 
     # 排名按**去重后的权重**算：同一份权重在多个格里出现（α=1 与端点格）不该
@@ -968,8 +1020,11 @@ def _r10_family(prepared, history, parent, data_dir, round_index, dataset_key,
         margin = round(abs(float(ranked[0]["value"]) - float(ranked[1]["value"])), 6)
 
     # 双列同生同灭：任一列有缺口（未评分格）的整对不进 alpha_grid，记进 grid_skipped。
+    # 退化对（只保留 α=1）也在这里排除：它们的 scores 只有 1 列，放进网格会让
+    # serialize_alpha_grid 的长度校验抛错。
     grid_pairs = [pair for pair in pairs
-                  if pair.get("sel") is not None
+                  if pair["id"] not in degenerate_ids
+                  and pair.get("sel") is not None
                   and all(isinstance(value, (int, float)) for value in pair["scores"])
                   and all(isinstance(value, (int, float))
                           for value in pair["scores_raw"])]
@@ -991,6 +1046,7 @@ def _r10_family(prepared, history, parent, data_dir, round_index, dataset_key,
         "pairs": [{"id": pair["id"], "sel": pair.get("sel")}
                   for pair in pairs],
         "grid_skipped": grid_skipped,
+        "soup_excluded": soup_excluded,
         "candidates": [
             {"pair": cell["pair"], "alpha": cell["alpha"],
              "sha256": str(cell.get("sha") or "")[:16],
@@ -1420,7 +1476,7 @@ def _read_history(state_path):
     return items[-HISTORY_KEEP:]
 
 
-def _archive_history(state_path, ckpt_path, round_index, metrics=None):
+def _archive_history(state_path, ckpt_path, round_index, metrics=None, tag=""):
     """把本轮上传载荷另存进 state/history（供 J1 历史对与 J5 的 R10 候选族）。
 
     只增不改；同一 sha 只留最早一条；文件数超过 HISTORY_KEEP + 2 时删最旧的。
@@ -1431,7 +1487,7 @@ def _archive_history(state_path, ckpt_path, round_index, metrics=None):
     if any(item.get("sha256") == sha for item in items):
         return None
     os.makedirs(_history_dir(state_path), exist_ok=True)
-    name = "round-%02d.npz" % int(round_index)
+    name = "round-%02d%s.npz" % (int(round_index), tag)
     target = os.path.join(_history_dir(state_path), name)
     temp = target + ".tmp"
     shutil.copyfile(ckpt_path, temp)
@@ -1570,6 +1626,308 @@ def _apply_local_best(rnd, prepared, best, state_path, data_dir, round_index,
     return record
 
 
+# ---------------------------------------------------------------- 输入动作通道（④）
+# official 产物的 metadata 可携带 causal 输入动作：predict 在 mean/scale 之前执行，
+# 动作输出替代归一化结果。这里负责"逐线实测再决定开不开"——同一份权重、同一份
+# validation 切片、同一把尺子；候选动作不优于 identity 就写 identity，并把原因与
+# 数字记进账本。分组闸只挡实测退化的分组，分组键取 predict 可见的 raw_id。
+ACTION_GRID = (0.5, 0.9, 0.99, 0.995, 0.999)
+# 只在"predict 能稳定拿到分组键"的线上开分组闸：B 的行 id 形如 xjtu_Bearing1_4_s000001。
+ACTION_GROUP = {"B": ("bearing", r"(Bearing\d+_\d+)")}
+_ACTION_CACHE = collections.OrderedDict()
+_ACTION_CACHE_MAX = 4
+
+
+def _action_rows(data_dir, ref, dataset_key):
+    """按产物 schema 读 validation 的**原始**特征与分组键（动作作用在归一化之前）。"""
+    import numpy as np
+
+    val_path = os.path.join(data_dir, train_mlp.VAL_NAME)
+    if not os.path.isfile(val_path):
+        raise TrainRoundError("找不到验证集：%s" % val_path)
+    n_features, task = ref["n_features"], ref["task"]
+    group_field = ACTION_GROUP.get(dataset_key, (None, None))[0]
+    key = (train_stage.file_key(val_path), n_features, task, dataset_key)
+    hit = _ACTION_CACHE.get(key)
+    if hit is not None:
+        _ACTION_CACHE.move_to_end(key)
+        return hit
+
+    rows, _bad = train_mlp._read_rows(val_path)
+    shape = None
+    for row in rows:
+        try:
+            signature = train_mlp._shape_of(row["inputs"])
+            probe = []
+            train_mlp._collect(row["inputs"], probe)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if len(probe) == n_features:
+            shape = signature
+            break
+    if shape is None:
+        raise TrainRoundError("验证集没有与产物特征维 %d 匹配的行" % n_features)
+
+    if task == "classification":
+        index = {str(name): i for i, name in enumerate(ref["meta"].get("classes") or [])}
+
+        def label_fn(row):
+            answer = row.get("answer")
+            return index.get(answer) if isinstance(answer, str) else None
+    else:
+        def label_fn(row):
+            answer = row.get("answer")
+            if isinstance(answer, bool) or not isinstance(answer, (int, float)):
+                return None
+            value = float(answer)
+            return value if math.isfinite(value) else None
+
+    xs, ys, groups = [], [], []
+    for row in rows:
+        values = []
+        try:
+            signature = train_stage._collect_sig(row["inputs"], values)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if signature != shape or len(values) != n_features:
+            continue
+        target = label_fn(row)
+        if target is None:
+            continue
+        xs.append(values)
+        ys.append(target)
+        group_meta = row.get("meta")
+        groups.append((group_meta.get(group_field) if isinstance(group_meta, dict) else None)
+                      if group_field else None)
+    if not xs:
+        raise TrainRoundError("验证集没有可用行，动作选型无从测量")
+    y = (np.asarray(ys, dtype=np.int64) if task == "classification"
+         else np.asarray(ys, dtype=float))
+    out = (np.asarray(xs, dtype=float), y, groups, task)
+    _ACTION_CACHE[key] = out
+    while len(_ACTION_CACHE) > _ACTION_CACHE_MAX:
+        _ACTION_CACHE.popitem(last=False)
+    return out
+
+
+def _action_forward(arrays, meta, task, z):
+    """与 predict 同口径：clip ±10σ → tanh 隐层 → 输出层 → target_scale/mean。"""
+    import numpy as np
+
+    z = np.clip(np.asarray(z, dtype=float), -10.0, 10.0)
+    out = np.tanh(z @ arrays["w1"] + arrays["b1"]) @ arrays["w2"] + arrays["b2"]
+    if task == "classification":
+        return out
+    value = (out[:, 0] * float(meta.get("target_scale", 1.0) or 1.0)
+             + float(meta.get("target_mean", 0.0) or 0.0))
+    return np.maximum(0.0, value)
+
+
+def _action_metric(task, y, out):
+    import numpy as np
+
+    if task == "classification":
+        return float(train_mlp._macro_f1(y, np.argmax(out, axis=1), int(out.shape[1])))
+    return float(math.sqrt(float(np.mean((out - y) ** 2))))
+
+
+def _action_run(name, params, x):
+    """逐行跑动作，返回变换后的特征矩阵（行序即文件序，causal 状态只向前累积）。"""
+    import numpy as np
+
+    prepared = actions.prepare(name, params, stage="predict")
+    state, rows = None, []
+    for vector in x:
+        vector, state = prepared["step"](vector, state, None)
+        rows.append(np.asarray(vector, dtype=float))
+    return np.vstack(rows)
+
+
+def _select_feature_action(dataset_key, checkpoint_path, data_dir):
+    """逐线实测：有利就开、不利就挡。返回可直接落进 metadata / 账本的决定。"""
+    import numpy as np
+
+    ref = train_mlp._load_parent(checkpoint_path)
+    x, y, groups, task = _action_rows(data_dir, ref, dataset_key)
+    arrays = {name: np.asarray(ref["arrays"][name], dtype=float)
+              for name in ("w1", "b1", "w2", "b2")}
+    meta = ref["meta"]
+    mean = np.asarray(ref["arrays"]["mean"], dtype=float).reshape(-1)
+    scale = np.asarray(ref["arrays"]["scale"], dtype=float).reshape(-1)
+    metric_name = "macro_f1" if task == "classification" else "rmse"
+
+    def improved(value, base):
+        if value is None:
+            return False
+        return value > base + 1e-12 if task == "classification" else value < base - 1e-12
+
+    def score(z_values):
+        return _action_metric(task, y, _action_forward(arrays, meta, task, z_values))
+
+    z_identity = np.clip((x - mean) / scale, -10.0, 10.0)
+    base = score(z_identity)
+    scores = {"identity": base}
+    best, best_value, best_z = ("identity", {}), base, z_identity
+    any_improved = False
+    candidates = [("streaming_ema_norm", {"alpha": alpha}) for alpha in ACTION_GRID]
+    candidates.append(("per_cond_seq", {}))
+    for name, params in candidates:
+        label = name if name == "per_cond_seq" else "ema%.4g" % params["alpha"]
+        try:
+            z_values = _action_run(name, params, x)
+        except actions.ActionError as exc:
+            scores[label] = None
+            _log("动作 %s 不可用（%s），跳过" % (name, exc))
+            continue
+        value = score(z_values)
+        scores[label] = value
+        if improved(value, base):
+            any_improved = True
+            if best[0] == "identity" or improved(value, best_value):
+                best, best_value, best_z = (name, dict(params)), value, z_values
+
+    # 交付口径：predict 实际会叠加输出侧校准，选型必须看到同一条曲线上的数字。
+    cal_pair = train_mlp._calibration_of(meta, task) if task == "regression" else None
+
+    def score_cal(z_values, target=None):
+        if cal_pair is None:
+            return None
+        target = y if target is None else target
+        raw = _action_forward(arrays, meta, task, z_values)
+        return float(math.sqrt(float(np.mean(
+            (np.maximum(0.0, cal_pair[0] * raw + cal_pair[1]) - target) ** 2))))
+
+    delivered_identity = score_cal(z_identity)
+
+    skip_groups, group_scores, group_pattern = [], {}, None
+    gated = best_value
+    z_final = best_z
+    if best[0] != "identity" and dataset_key in ACTION_GROUP:
+        _field, group_pattern = ACTION_GROUP[dataset_key]
+        if groups and all(item is not None for item in groups):
+            keep = np.ones(len(groups), dtype=bool)
+            for group in sorted(set(groups)):
+                mask = np.asarray([item == group for item in groups])
+                before = _action_metric(task, y[mask],
+                                        _action_forward(arrays, meta, task, z_identity[mask]))
+                after = _action_metric(task, y[mask],
+                                       _action_forward(arrays, meta, task, best_z[mask]))
+                group_scores[str(group)] = {"identity": before, "action": after,
+                                            "n": int(mask.sum())}
+                if cal_pair is not None:
+                    group_scores[str(group)]["delivered_identity"] = score_cal(
+                        z_identity[mask], y[mask])
+                    group_scores[str(group)]["delivered_action"] = score_cal(
+                        best_z[mask], y[mask])
+                if not improved(after, before):
+                    skip_groups.append(str(group))
+                    keep &= ~mask
+            if len(skip_groups) == len(group_scores):
+                best, best_value, gated = ("identity", {}), base, base
+                z_final = z_identity
+                skip_groups = []
+            elif skip_groups:
+                # 与 predict 同口径：被挡的行完全不进动作，状态只由动作行累积。
+                z_gated = z_identity.copy()
+                z_gated[keep] = _action_run(best[0], best[1], x[keep])
+                gated = score(z_gated)
+                z_final = z_gated
+            group_pattern = group_pattern if skip_groups else None
+
+    if best[0] == "identity":
+        reason = ("候选动作在全部有效分组上退化" if any_improved
+                  else "候选动作全部不优于 identity")
+    else:
+        reason = "逐线实测优于 identity"
+        if skip_groups:
+            reason += "；分组闸挡下 %s" % ",".join(skip_groups)
+    return {"action": best[0], "params": dict(best[1]), "metric": metric_name,
+            "identity": base, "selected": best_value, "gated": gated,
+            "delivered": score_cal(z_final), "delivered_identity": delivered_identity,
+            "skip_groups": skip_groups, "group_pattern": group_pattern,
+            "groups": group_scores, "scores": scores, "reason": reason}
+
+
+def _action_metadata_write(path, selection):
+    """只增/删动作字段，权重与其他 metadata 字段原样保留；无变化则不重写。"""
+    import numpy as np
+
+    with np.load(path, allow_pickle=False) as archive:
+        arrays = {name: archive[name] for name in archive.files}
+    raw = arrays.pop("metadata", None)
+    meta = {}
+    if raw is not None:
+        try:
+            meta = json.loads(str(np.asarray(raw).tolist()))
+        except (ValueError, TypeError):
+            raise TrainRoundError("载荷 metadata 不是合法 JSON")
+        if not isinstance(meta, dict):
+            raise TrainRoundError("载荷 metadata 不是 JSON 对象")
+    fields = ("feature_action", "feature_action_params",
+              "feature_action_skip_groups", "feature_action_group_pattern")
+    before = {name: meta.get(name) for name in fields}
+    for name in fields:
+        meta.pop(name, None)
+    if selection["action"] != "identity":
+        meta["feature_action"] = selection["action"]
+        meta["feature_action_params"] = dict(selection["params"])
+        if selection.get("skip_groups"):
+            meta["feature_action_skip_groups"] = list(selection["skip_groups"])
+            meta["feature_action_group_pattern"] = selection["group_pattern"]
+    after = {name: meta.get(name) for name in fields}
+    if before == after:
+        return False
+    payload = dict(arrays)
+    payload["metadata"] = np.array(json.dumps(meta, ensure_ascii=False, sort_keys=True))
+    tmp = path + ".action-tmp"
+    try:
+        with open(tmp, "wb") as handle:
+            np.savez(handle, **payload)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    return True
+
+
+def _stamp_feature_action(dataset_key, prepared, data_dir):
+    """提交/归档前把动作决定落到载荷，并记进 built 供账本对账。"""
+    if not dataset_key:
+        return None
+    payload_dir = prepared.get("payload_dir") or prepared.get("dir")
+    if not payload_dir:
+        return None
+    path = os.path.join(payload_dir, CHECKPOINT_NAME)
+    if not os.path.isfile(path):
+        return None
+    built = prepared.setdefault("built", {})
+    current = _sha256_file(path)
+    if built.get("feature_action") and built.get("feature_action_sha256") == current:
+        return built["feature_action"]
+    try:
+        selection = _select_feature_action(dataset_key, path, data_dir)
+    except Exception as exc:  # noqa: BLE001 - 选型失败保持 identity，不拖垮提交
+        _log("输入动作选型失败（保持 identity）：%s: %s" % (type(exc).__name__, exc))
+        selection = {"action": "identity", "params": {}, "metric": None,
+                     "identity": None, "selected": None, "gated": None,
+                     "skip_groups": [], "group_pattern": None, "groups": {},
+                     "scores": {}, "reason": "measurement_failed: %s" % type(exc).__name__}
+    changed = _action_metadata_write(path, selection)
+    selection = dict(selection)
+    selection["metadata_written"] = bool(changed)
+    built["feature_action"] = selection
+    built["feature_action_sha256"] = _sha256_file(path)
+    if changed:
+        built["sha256"] = built["feature_action_sha256"]
+        _log("输入动作写入载荷：action=%s params=%s metric=%s identity=%s selected=%s%s"
+             % (selection["action"], selection["params"], selection["metric"],
+                selection["identity"], selection["selected"],
+                (" 分组闸=%s" % selection["skip_groups"]) if selection["skip_groups"] else ""))
+    else:
+        _log("输入动作保持 identity（载荷未改写）：%s" % selection["reason"])
+    return selection
+
+
 def run(rnd, data_dir=None, work_dir=None, pessimism_k=None):
     """执行一轮训练。返回 ledger（同时落盘）。异常即整轮不提交。
 
@@ -1661,7 +2019,9 @@ def run(rnd, data_dir=None, work_dir=None, pessimism_k=None):
         call = _call_model(rnd, messages)
         calls.append(call)
         last_text = call["text"]
-        review = llm_cage.review(last_text, context)
+        # 数字白名单只认提示词里出现过的数值：模型复述检测器/账本读数属合法引用。
+        review = llm_cage.review(
+            last_text, dict(context, numeric_frame=llm_cage.frame_numbers(messages)))
         if review["status"] == "ok":
             break
         last_errors = review["errors"]
@@ -1825,12 +2185,15 @@ def run(rnd, data_dir=None, work_dir=None, pessimism_k=None):
     # 构建失败也走同一次修复预算：把错误原文回灌，只修一次。
     if prepared is None and chosen != PARENT and len(calls) < MAX_MODEL_CALLS:
         _log("把构建错误回灌模型做一次修复")
-        call = _call_model(rnd, llm_cage.repair_messages(
+        retry_messages = llm_cage.repair_messages(
             card, last_text, build_errors, data_summary,
-            detection.get("detectors"), recommendation, round_index, failed_combos))
+            detection.get("detectors"), recommendation, round_index, failed_combos)
+        call = _call_model(rnd, retry_messages)
         calls.append(call)
         gate["calls"].extend(_rpc_entries(call))
-        retry = llm_cage.review(call["text"], context)
+        retry = llm_cage.review(
+            call["text"],
+            dict(context, numeric_frame=llm_cage.frame_numbers(retry_messages)))
         if (retry.get("raw") or {}).get("build_script"):
             gate["runtime_code_gen"]["attempted"] = True
             if not llm_cage.runtime_code_gen_enabled():
@@ -1902,9 +2265,73 @@ def run(rnd, data_dir=None, work_dir=None, pessimism_k=None):
             policy = "fallback_parent_after_rule"
             model_note = None
 
+    # 四臂同尺：每轮把 PARENT/A/B/C 都构造出来，在同一份验证切片上各打一次分。
+    # 评分本身不改选臂；只有在模型提案不可用、规则臂兜底、且回归线实测存在
+    # 严格更优臂时，才用**同一组闸门**（state_gate / 悲观界 / prepare 的候选自检）
+    # 接管载荷。阈值与 rel_l2 上限不动。
+    try:
+        arm_scores = _score_arms(parent, data, round_index,
+                                 getattr(rnd, "dataset_key", None),
+                                 work, chosen, prepared)
+    except Exception as exc:  # noqa: BLE001 - 评分失败不能拖垮本轮提交
+        _log("四臂评分失败（忽略，不参与选臂）：%s: %s"
+             % (type(exc).__name__, str(exc)[:200]))
+        arm_scores = {"slice": {"error": "%s: %s" % (type(exc).__name__, str(exc)[:160])},
+                      "arms": {}, "best": None, "chosen": chosen,
+                      "chosen_is_best": None, "best_candidates": [], "best_tied": None}
+
+    if (policy == "fallback_rule" and chosen != PARENT
+            and getattr(rnd, "dataset_key", None) in ("B", "C")):
+        takeover = selector.best_scored_arm(arm_scores)
+        if takeover:
+            stats = arms_in.get(takeover) or {}
+            cooldown = int(stats.get("cooldown", 0) or 0)
+            bound = _arm_bound(stats, k)
+            allowed, gate_reason, gate_evidence = llm_cage.state_gate(takeover, context)
+            reason = None
+            if cooldown > 0:
+                reason = "cooldown"
+            elif bound is not None and parent_bound is not None and bound < parent_bound:
+                reason = "bound_below_parent"
+            elif not allowed:
+                reason = "state_gate_%s" % gate_reason
+            delta = selector.best_arm_delta(arm_scores, takeover)
+            if reason is None:
+                try:
+                    prepared_takeover = prepare(takeover, {}, None,
+                                                "arm-best-%s" % takeover)
+                    arm_scores["takeover"] = {
+                        "from": chosen, "to": takeover, "applied": True,
+                        "metric": (arm_scores.get("slice") or {}).get("metric"),
+                        "delta": delta,
+                        "gate": {"ok": allowed, "reason": gate_reason}}
+                    _log("规则臂 %s 非四臂最优；按同一闸门接管 %s（改进 %.6f）"
+                         % (chosen, takeover, delta or 0.0))
+                    prepared = prepared_takeover
+                    chosen = takeover
+                    policy = "arm_score_takeover"
+                    model_note = None
+                except Exception as exc:  # noqa: BLE001 - 接管失败保持原臂
+                    arm_scores["takeover"] = {
+                        "from": chosen, "to": takeover, "applied": False,
+                        "reason": "prepare_failed: %s" % str(exc)[:160],
+                        "delta": delta,
+                        "gate": {"ok": allowed, "reason": gate_reason}}
+                    _log("接管臂 %s 未过闸门（%s）；保持 %s" % (takeover, exc, chosen))
+            else:
+                arm_scores["takeover"] = {
+                    "from": chosen, "to": takeover, "applied": False,
+                    "reason": reason, "delta": delta,
+                    "gate": {"ok": allowed, "reason": gate_reason}}
+                _log("接管臂 %s 被悲观界/状态闸门否掉（%s）；保持 %s"
+                     % (takeover, reason, chosen))
+        arm_scores["chosen"] = chosen
+        arm_scores["chosen_is_best"] = bool(arm_scores.get("best") == chosen)
+
     # ---- v6：输出层偏置候选族（当轮切片测量 + EMA，全程无梯度）----
     # 候选生成 → 性质测试 → 用当轮切片逐个测量 → 选最优 → 提交 EMA 值。
     # 两级兜底：切片不可用 → 常数 δ；候选全被 cage 拒 → 退回父产物。
+    # 放在四臂评分与接管之后：保证四臂在同一"未校准"口径上比较，偏置只作用于最终臂。
     bias_record = None
     bias_ema = None
     if chosen != PARENT:
@@ -1939,19 +2366,10 @@ def run(rnd, data_dir=None, work_dir=None, pessimism_k=None):
                        "arm": str(getattr(rnd, "dataset_key", None) or ""),
                        "status": "skipped_parent", "applied": False}
 
-    # 四臂同尺：每轮把 PARENT/A/B/C 都构造出来，在同一份验证切片上各打一次分。
-    # 只记录、不参与选臂：这是"模型选 / 规则选 / 实际最优"的唯一原始数据；
-    # 真实最优的判定也在这里（chosen_is_best），不在报告阶段重跑。
-    try:
-        arm_scores = _score_arms(parent, data, round_index,
-                                 getattr(rnd, "dataset_key", None),
-                                 work, chosen, prepared)
-    except Exception as exc:  # noqa: BLE001 - 记录失败不能拖垮本轮提交
-        _log("四臂评分失败（忽略，不参与选臂）：%s: %s"
-             % (type(exc).__name__, str(exc)[:200]))
-        arm_scores = {"slice": {"error": "%s: %s" % (type(exc).__name__, str(exc)[:160])},
-                      "arms": {}, "best": None, "chosen": chosen,
-                      "chosen_is_best": None}
+    # 偏置族回退可能把最终臂改成 PARENT；四臂表里的 chosen/判定按最终臂对齐。
+    if isinstance(arm_scores, dict) and arm_scores.get("arms"):
+        arm_scores["chosen"] = chosen
+        arm_scores["chosen_is_best"] = bool(arm_scores.get("best") == chosen)
 
     # 本地历史最优：副本在 state 目录里，不向平台读回任何历史产物（读取次数 0）。
     best_record = None
@@ -1984,6 +2402,9 @@ def run(rnd, data_dir=None, work_dir=None, pessimism_k=None):
             r10_record = {"status": "error",
                           "error": "%s: %s" % (type(exc).__name__, str(exc)[:200])}
 
+    # v7 ④：载荷定稿后、归档与提交之前，逐线实测并写入输入动作（不利则保持 identity）。
+    _stamp_feature_action(getattr(rnd, "dataset_key", None), prepared, data)
+
     # v7 J1：把本轮实际上传的载荷另存进 state/history，供下一轮历史对与 R10 候选族。
     # 失败不拖垮提交（候选族是增益项），但要在日志里留痕。
     try:
@@ -1994,6 +2415,18 @@ def run(rnd, data_dir=None, work_dir=None, pessimism_k=None):
             metrics=(best_record or {}).get("current_metrics"))
         if archived:
             _log("历史候选已归档：第%s轮 sha=%s" % (round_index, archived["sha256"][:16]))
+        # v7 J1c：父权重被 keep 守卫留下时，把本轮"训练终点"也归档成独立端点。
+        # 只归档上传载荷会让历史端点同 sha 去重后只剩父一条，插值族无方向可用。
+        endpoint = ((prepared.get("built") or {}).get("training") or {}).get("trained_endpoint")
+        if endpoint:
+            archived_ep = _archive_history(
+                state_path, endpoint["path"], round_index,
+                metrics={"round": int(round_index), "rel_l2": endpoint.get("rel_l2"),
+                         "role": "trained_endpoint"},
+                tag="-endpoint")
+            if archived_ep:
+                _log("训练终点已归档：第%s轮 sha=%s rel_l2=%s"
+                     % (round_index, archived_ep["sha256"][:16], endpoint.get("rel_l2")))
     except Exception as exc:  # noqa: BLE001
         _log("历史候选归档失败（忽略）：%s: %s" % (type(exc).__name__, str(exc)[:200]))
 
@@ -2117,7 +2550,9 @@ def run(rnd, data_dir=None, work_dir=None, pessimism_k=None):
         bias = prep["built"].get("bias") or {}
         if bias.get("uploaded"):
             # 只有校准真进了载荷才写进 hypothesis；applied 只说明候选被改过。
-            hyp = "%s；输出侧按当轮切片选%s（EMA）" % (hyp, _bias_label(bias))
+            # 提交来源随臂不同：C 是 EMA，B 是 4 折折外最优（cv）。
+            src = (bias.get("chosen") or {}).get("source") or "ema"
+            hyp = "%s；输出侧按当轮切片选%s（%s）" % (hyp, _bias_label(bias), src)
         if payload_round is not None:
             # 载荷是历史最优副本：不再声称"与父产物逐字节一致"（那描述的是本轮候选，
             # 不是上传物），改为按 sha 对账后的载荷来源陈述。
@@ -2197,6 +2632,26 @@ def run(rnd, data_dir=None, work_dir=None, pessimism_k=None):
             "budget": prep.get("payload_budget") or prep["budget"],
             "seed": round_index,
         }
+        # v7 ④：本轮输入动作决定（逐线实测的数字、分组闸与保持 identity 的原因）。
+        selection = prep["built"].get("feature_action")
+        if selection:
+            cfg["feature_action"] = {
+                "a": selection.get("action"),
+                "p": selection.get("params") or {},
+                "m": selection.get("metric"),
+                "id": selection.get("identity"),
+                "sel": selection.get("selected"),
+                "g": selection.get("gated"),
+                "skip": selection.get("skip_groups") or [],
+                "grp": selection.get("groups") or {},
+                "why": selection.get("reason"),
+                "w": 1 if selection.get("metadata_written") else 0,
+            }
+            # 交付口径（校准后）只对带 calibration 的回归产物有意义；分类线与未带
+            # 校准的产物省略这两个键（A 线账本因此与改动前逐字节一致）。
+            if selection.get("delivered") is not None:
+                cfg["feature_action"]["d"] = selection["delivered"]
+                cfg["feature_action"]["di"] = selection.get("delivered_identity")
         # v7 J2：本轮训练的 Adam 续训装载口径（fresh 清单 + 与父产物声明的对账结果）。
         # 只有真训练过的候选才有这一项；PARENT 轮次不训练，不写。
         training = prep["built"].get("training") or {}
@@ -2258,6 +2713,7 @@ def run(rnd, data_dir=None, work_dir=None, pessimism_k=None):
                 "mg": r10_record.get("margin"),
                 "chg": r10_record.get("payload_changed"),
                 "skip": r10_record.get("grid_skipped"),
+                "ex": r10_record.get("soup_excluded"),
                 "err": r10_record.get("error"),
                 "sel": (None if not selected else
                         {"p": selected.get("pair"), "a": selected.get("alpha"),
@@ -2349,6 +2805,7 @@ def run(rnd, data_dir=None, work_dir=None, pessimism_k=None):
                                  "error": "%s: %s" % (type(exc).__name__, str(exc)[:200])}
         prepared = prepare(PARENT, {}, None, "PARENT-submit-retry")
         chosen = PARENT
+        _stamp_feature_action(getattr(rnd, "dataset_key", None), prepared, data)
         hypothesis, change, configuration = make_configuration(PARENT, prepared, policy)
         try:
             submitted = _submit(_payload(prepared))
@@ -2408,6 +2865,18 @@ def run(rnd, data_dir=None, work_dir=None, pessimism_k=None):
     ledger["artifact_id"] = artifact_id
     ledger["finish_artifact_id"] = finish_id
     ledger["best"] = best_record
+    # 载荷事实：本轮真正上传的那份（payload_dir 优先）的 sha 与 metadata.calibration，
+    # 让"校准是否进产物"能在账本里直接对账，不必回读工作目录。
+    payload_path = os.path.join(_payload(prepared), CHECKPOINT_NAME)
+    try:
+        payload_meta = train_mlp._load_parent(payload_path)["meta"]
+    except Exception:  # noqa: BLE001 - 读不出就留空，不影响本轮提交
+        payload_meta = {}
+    ledger["payload"] = {
+        "path": payload_path,
+        "sha256": (_sha256_file(payload_path) if os.path.isfile(payload_path) else None),
+        "calibration": payload_meta.get("calibration"),
+    }
     ledger_path = os.path.join(work, "round-%s" % round_index, LEDGER_FILE)
     _dump_json(ledger_path, ledger)
 

@@ -13,6 +13,10 @@ from .alpha_lib import InterpolationError, damping_ratio, lambda_init
 TRIGGER_TOL = 0.1   # d₀ ≤ (1+TOL)×目标 → 不触发
 CONVERGE_TOL = 0.1  # rel_l2 ∈ [0.9, 1.1]×目标 → 收敛
 MAX_ITER = 6
+# rel_l2 ≤ 此值 = 训练端点与起点逐位相同：没有任何一轮跑赢父产物，
+# 位移恒为 0。这不是"阻尼恰好"的读数，而是"锚把模型冻住"的退化点，
+# 不能当成可收敛点参与选点（2026-11-22 修正）。
+DEGENERATE_EPS = 1e-12
 
 
 class CalibrationError(InterpolationError):
@@ -73,21 +77,36 @@ def calibrate_lambda(measure_fn, d_target, eta, steps,
                 "d0": d0, "trace": trace, "reason": plan["reason"]}
     lo, hi = plan["bracket"]
     best = None
+    probed = 0
     for _ in range(max_iter):
         mid = (lo * hi) ** 0.5  # λ 跨数量级，几何中点
         rel = float(measure_fn(mid))
+        probed += 1
         trace.append({"lambda": mid, "rel_l2": rel})
+        if rel <= DEGENERATE_EPS:
+            # 退化点：锚把训练冻住（没有任何一轮被接受），位移恒 0。
+            # 语义是"锚过强"，不是"阻尼刚好"；既不参与 best，也向更小 λ 收缩。
+            hi = mid
+            continue
         if abs(rel - d_target) <= converge_tol * d_target:
             return {"lambda": mid, "triggered": True, "unconverged": False,
                     "d0": d0, "trace": trace}
-        best = (mid, rel) if best is None or \
-            abs(rel - d_target) < abs(best[1] - d_target) else best
+        if best is None or abs(rel - d_target) < abs(best[1] - d_target):
+            best = (mid, rel)
         if rel > d_target:  # 阻尼不足
             lo = mid
         else:               # 阻尼过度
             hi = mid
-    # 耗尽：取最接近目标的实测点并显式标记，不静默收边
-    lam_star = best[0] if best else hi
+    if best is None:
+        # 所有探针都把训练冻住：目标带在"仍可训练"的区间里不可达。
+        # 正确处置是关掉锚（λ=0，正则不介入），而不是退回最冻的那个 λ。
+        return {"lambda": 0.0, "triggered": False, "unconverged": True,
+                "degenerate": True, "d0": d0, "trace": trace,
+                "reason": "全部 %d 次探针把训练冻住（rel_l2≤%.0e），"
+                          "目标带不可达，回退 λ=0（L2-SP 不介入）"
+                          % (probed, DEGENERATE_EPS)}
+    # 耗尽：取最接近目标的**有效**实测点并显式标记，不静默收边
+    lam_star = best[0]
     return {"lambda": lam_star, "triggered": True, "unconverged": True,
             "d0": d0, "trace": trace,
             "reason": "%d 次二分未进 %.0f%% 带，取最接近实测点"
