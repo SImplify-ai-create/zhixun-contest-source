@@ -522,7 +522,224 @@
    "date": "2026-11-22",
    "hash_of": "content",
    "id": "arm-takeover-2026-11-22.v1",
-   "sha256": "e4702a9702b0e716499013fa38926b59c67953ed991d24813894c7a190210bbc"
+   "sha256": "e4702a9702b0e716499013fa38926b59c67953ed991d24813894c7a190210bbc",
+   "status": "superseded_by_arm-takeover-2026-11-22.v3"
+  },
+  {
+   "canonical": "json/utf-8/sort_keys/indent=1",
+   "content": {
+    "append_reason": "v1 只覆盖 B/C 线与 fallback_rule 且 chosen≠PARENT；本版把同一接管规则扩到三条线、全部策略，先登记为 pending，不启用、不改任何阈值。",
+    "appended_before_implementation": true,
+    "date": "2026-11-23",
+    "evidence": {
+     "better": 13,
+     "caveat": "13 轮里 2 轮为 cage_final_round（F1:A:R10、run2b:A:R10）；若最终轮不允许装载新载荷，A 线增益降至 0.616254。",
+     "counterfactual_note": "逐轮独立反事实，不是顺序模拟；不构成部署后的实测结果",
+     "cum_gain": {
+      "A_macro_f1_points": 0.731546,
+      "B_rmse_reduction": 17.712068,
+      "C_rmse_reduction": 0.0
+     },
+     "flat": 0,
+     "ledger": "outputs/takeover_replay_80.json（80 轮只读回放，反事实）",
+     "max_single_round": {
+      "A": {
+       "delta": 0.181829,
+       "round": "run2b:A:R8"
+      },
+      "B": {
+       "delta": 8.268972,
+       "round": "chain10@2026-11-17:B:R1"
+      }
+     },
+     "reselect_rounds": 13,
+     "worse": 0
+    },
+    "fallback": "任一触发或闸门不满足，保留原载荷，不改写本轮既有记录。",
+    "gates": {
+     "cooldown": "pessimism.cooldown[arm] == 0",
+     "no_threshold_change": true,
+     "pessimistic_bound": "arm bound >= parent bound（任一缺失则跳过该比较）",
+     "prepare": {
+      "budget": "候选体积/数量预算",
+      "candidate_check": "features/action/文件数与体积；权重位移 cap 与既有口径同源（A/B rel_l2 0.1；C 线按 v3 预测位移 0.11）",
+      "red_team": "5 条确定性红队问题；fallback 路径本来就不跑模型红队，接管与它同口径"
+     },
+     "state_gate": "llm_cage.state_gate：final_round / unseen_signature 等原判定"
+    },
+    "id": "arm-takeover-2026-11-22.v2",
+    "purpose": "四臂同尺评分后，把载荷从当前选择接管到严格更优、且能过全套既有闸门的真实新候选；v2 仅扩大适用范围，规则本体与 v1 相同。",
+    "scope": {
+     "dataset_key": [
+      "A",
+      "B",
+      "C"
+     ],
+     "layer": "载荷接管（与 _apply_local_best 同层），不改变 selector.select() 的方案臂",
+     "policy": [
+      "model_proposal",
+      "fallback_rule",
+      "cage_final_round"
+     ]
+    },
+    "selection_statistics": {
+     "not_used_for": "训练配方/超参选择；不改变 C4 折内均值选择统计",
+     "rule_selector_unchanged": "selector.select() 仍先按 train 侧检测器出方案臂（验证盲）",
+     "takeover_input": "同一轮已构建四臂、同一份验证切片的评分表"
+    },
+    "supersedes": "arm-takeover-2026-11-22.v1",
+    "trigger": {
+     "chosen_not_parent": false,
+     "exclude_parent": true,
+     "fallback_only": false,
+     "real_new_candidate": "arm.changed != false（changed=false 等价父副本，不接管）",
+     "strictly_better": "rmse: best < chosen - 1e-12；macro_f1: best > chosen + 1e-12",
+     "tie": "平局不接管"
+    }
+   },
+   "date": "2026-11-23",
+   "hash_of": "content",
+   "id": "arm-takeover-2026-11-22.v2",
+   "sha256": "ce4d4d8df303d11cdf9964f60a53b5c1616b8af9b1560785a26124ad4ee19eaa",
+   "status": "superseded_by_arm-takeover-2026-11-22.v3"
+  },
+  {
+   "canonical": "json/utf-8/sort_keys/indent=1",
+   "content": {
+    "append_reason": "分半交叉拟合落地保守版：规则仍为“同切片严格占优才接管、平局不接管”，阈值一条不新增（沿用既有 rel_l2 上限、state_gate、cooldown），适用范围沿用 v2 的三线全部策略。证据：13 个原可改选轮中仅 2 个可分半（覆盖 2/13）；chain10:B:R1 的 Δ=+8.268972、跨半 40/40 严格变好、最差仍 +6.301331，站住；chain10:B:R2 的 Δ=+0.587062、跨半 10 好/15 平/15 坏、最差 −0.980775，站不住且出现反向变坏。判据“一半以上站得住且无一轮反向变坏”不通过，故不写“稳健”，只按保守版启用。其余 11 轮（F1/run2b）无本地 checkpoint，分半波动未验证。",
+    "appended_after_implementation": true,
+    "appended_note": "接管代码（selector.best_scored_arm / best_arm_delta，train_round 调用点）已在工作区落地；v3 只补分半证据、确认保守语义与限制，不回改任何阈值或既有条目。",
+    "date": "2026-11-23",
+    "evidence": {
+     "better": 13,
+     "caveat": "13 轮里 2 轮为 cage_final_round（F1:A:R10、run2b:A:R10）；若最终轮不允许装载新载荷，A 线增益降至 0.616254。",
+     "counterfactual_note": "逐轮独立反事实，不是顺序模拟；不构成部署后的实测结果",
+     "cum_gain": {
+      "A_macro_f1_points": 0.731546,
+      "B_rmse_reduction": 17.712068,
+      "C_rmse_reduction": 0.0
+     },
+     "flat": 0,
+     "ledger": "outputs/takeover_replay_80.json（80 轮只读回放，反事实）",
+     "max_single_round": {
+      "A": {
+       "delta": 0.181829,
+       "round": "run2b:A:R8"
+      },
+      "B": {
+       "delta": 8.268972,
+       "round": "chain10@2026-11-17:B:R1"
+      }
+     },
+     "reselect_rounds": 13,
+     "split_half": {
+      "coverage": "2/13 个原可改选轮（仅 chain10:B:R1、B:R2 有本地四臂 checkpoint）",
+      "criterion": "跨半仍有一半以上改选站得住且无任何一轮反向变坏",
+      "criterion_result": "不通过（可验证 2 轮中仅 1 轮站住；R2 出现反向变坏）",
+      "false_switch_control": {
+       "loss_mean_rmse": -0.011961,
+       "loss_worst_rmse": -0.026111,
+       "rate": 0.026,
+       "rounds": 25,
+       "switches": 26,
+       "trials": 1000
+      },
+      "k_seeds": 20,
+      "method": "每轮验证切片按机组/批次分层分半（A=source_batch，实测恒为 2、退化为随机对半；B=bearing，3 层；C=unit，62 层）；半上按四臂实测分选臂（仅当该半最优严格优于原载荷才切、平局不切），另一半打分；正向/反向各 20 次。",
+      "payload_half_drift_abs_mean_rmse": {
+       "chain10@2026-11-17:B:R1": 14.164567,
+       "chain10@2026-11-17:B:R2": 14.185611
+      },
+      "rounds": {
+       "chain10@2026-11-17:B:R1": {
+        "full_delta_rmse": 8.268972,
+        "max": 10.19533,
+        "mean_delta": 8.266189,
+        "min": 6.301331,
+        "strict_better": 40,
+        "tie": 0,
+        "trials": 40,
+        "verdict": "站住（无反向变坏）",
+        "worse": 0
+       },
+       "chain10@2026-11-17:B:R2": {
+        "full_delta_rmse": 0.587062,
+        "max": 1.130337,
+        "mean_delta": 0.005304,
+        "min": -0.980775,
+        "strict_better": 10,
+        "tie": 15,
+        "trials": 40,
+        "verdict": "站不住（有反向变坏）",
+        "worse": 15
+       }
+      },
+      "source": "outputs/split_half_takeover.json（脚本 work/split_half_takeover.py，种子 0–19）",
+      "unverified_changed": [
+       "F1@2026-11-22:A:R10",
+       "F1@2026-11-22:B:R1",
+       "F1@2026-11-22:B:R2",
+       "run2b:A:R3",
+       "run2b:A:R4",
+       "run2b:A:R5",
+       "run2b:A:R6",
+       "run2b:A:R7",
+       "run2b:A:R8",
+       "run2b:A:R9",
+       "run2b:A:R10"
+      ]
+     },
+     "worse": 0
+    },
+    "fallback": "任一触发或闸门不满足，保留原载荷，不改写本轮既有记录。",
+    "gates": {
+     "cooldown": "pessimism.cooldown[arm] == 0",
+     "no_threshold_change": true,
+     "pessimistic_bound": "arm bound >= parent bound（任一缺失则跳过该比较）",
+     "prepare": {
+      "budget": "候选体积/数量预算",
+      "candidate_check": "features/action/文件数与体积；权重位移 cap 与既有口径同源（A/B rel_l2 0.1；C 线按 v3 预测位移 0.11）",
+      "red_team": "5 条确定性红队问题；fallback 路径本来就不跑模型红队，接管与它同口径"
+     },
+     "state_gate": "llm_cage.state_gate：final_round / unseen_signature 等原判定"
+    },
+    "id": "arm-takeover-2026-11-22.v3",
+    "limitation": "可验证覆盖 2/13，且仅 1 轮稳健；F1/run2b 的 11 轮分半波动未验证，不得据此宣称整体稳健。",
+    "purpose": "四臂同尺评分后，把载荷从当前选择接管到严格更优、且能过全套既有闸门的真实新候选；v3 确认保守语义（同切片严格占优才接管、平局不接管），并用分半交叉拟合给出可信度边界。",
+    "rule_version": "conservative_same_slice_strict",
+    "scope": {
+     "dataset_key": [
+      "A",
+      "B",
+      "C"
+     ],
+     "layer": "载荷接管（与 _apply_local_best 同层），不改变 selector.select() 的方案臂",
+     "policy": [
+      "model_proposal",
+      "fallback_rule",
+      "cage_final_round"
+     ]
+    },
+    "selection_statistics": {
+     "not_used_for": "训练配方/超参选择；不改变 C4 折内均值选择统计",
+     "rule_selector_unchanged": "selector.select() 仍先按 train 侧检测器出方案臂（验证盲）",
+     "takeover_input": "同一轮已构建四臂、同一份验证切片的评分表"
+    },
+    "supersedes": "arm-takeover-2026-11-22.v2",
+    "trigger": {
+     "chosen_not_parent": false,
+     "exclude_parent": true,
+     "fallback_only": false,
+     "real_new_candidate": "arm.changed != false（changed=false 等价父副本，不接管）",
+     "strictly_better": "rmse: best < chosen - 1e-12；macro_f1: best > chosen + 1e-12",
+     "tie": "平局不接管"
+    }
+   },
+   "date": "2026-11-23",
+   "hash_of": "content",
+   "id": "arm-takeover-2026-11-22.v3",
+   "sha256": "97fb47676769e5f167f0e355b5873d73b269972acd07418353f7aa9a205af3a9",
+   "status": "active"
   }
  ],
  "schema": "contest.v7.preregistration"
