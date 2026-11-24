@@ -2,7 +2,7 @@
 
 > 源码与镜像复现说明
 
-> 本文所有哈希、tag、文件数均为 2026-11-24 在本机实测，出处见 §0。旧版 README 中的 `v3-repick`、`9D8B4870…`、"10 个 .py" 三处已作废，不再保留。
+> 本文所有哈希、tag、文件数均为 2026-11-24 在本机实测，出处见 §0。
 >
 > **状态**：本仓库 `main` 的最新提交为本次文档更新（仅 `README.md`，不改变 `submission/app/`）；其上游 `74ba580` 对应 Release [`v7-run5`](https://github.com/SImplify-ai-create/zhixun-contest-source/releases/tag/v7-run5)，资产 sha256 与本文一致。
 
