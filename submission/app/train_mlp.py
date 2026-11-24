@@ -186,22 +186,9 @@ def _collect(value, out):
 def _read_rows(path):
     if not os.path.isfile(path):
         raise TrainMlpError("找不到数据文件：%s" % path)
-    rows, bad = [], 0
-    with open(path, "r", encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except ValueError:
-                bad += 1
-                continue
-            if not isinstance(obj, dict) or not isinstance(obj.get("inputs"), dict):
-                bad += 1
-                continue
-            rows.append(obj)
-    return rows, bad
+    # C 线性能：与 train_stage / _slice_card 共用同一份按文件缓存的解析结果，
+    # 不再对同一份 train/validation 重复 json.loads。返回口径与旧实现一致。
+    return train_stage.load_jsonl(path)
 
 
 def _extract(rows, shape, n_features, label_fn):

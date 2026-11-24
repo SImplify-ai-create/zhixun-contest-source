@@ -56,6 +56,9 @@ DIGITS = re.compile(r"[0-9]")
 # （状态卡实测值、账本分数、当轮轮次号）与本提案自己的参数值；凭空编造的
 # 0.02 / 3.5 / 123 仍是越界 token。token 支持科学计数法，避免 1e-6 被拆成 1 和 6。
 NUMBER_TOKEN = re.compile(r"\d+(?:\.\d+)?(?:[eE][-+]?\d+)?")
+# 白名单只收 finite 且 |x| <= 1e12 的值：更大的数在本题的量纲里没有意义，
+# 只可能是从十六进制 artifact_id 里误抽出来的噪声（3e999 → inf，3e12 → 天文数字）。
+NUM_ABS_LIMIT = 1e12
 # 引用账本行：英文 round-3 / h-2 / A-3，以及中文“第3轮”“第 3 轮”。
 LEDGER_REF = re.compile(r"(?:round|ledger|h|H)[-_]?\d+|[A-Za-z]+-\d+|第\s*\d+\s*轮")
 NO_HISTORY_PHRASES = (
@@ -450,9 +453,15 @@ def _numeric_values(text):
     values = []
     for token in NUMBER_TOKEN.findall(str(text or "")):
         try:
-            values.append(float(token))
+            value = float(token)
         except ValueError:
             continue
+        # 十六进制 artifact_id 里会抽出形如 3e999 的片段，float() 溢出成 inf；
+        # inf 会让 SDK 的 allow_nan=False 直接抛 ValueError，也会让
+        # _is_allowed_number 的 int(abs(ref)) 抛 OverflowError。非有限值与
+        # 超出 |x| <= 1e12 的噪声一律挡在白名单外。
+        if math.isfinite(value) and abs(value) <= NUM_ABS_LIMIT:
+            values.append(value)
     return values
 
 
@@ -492,9 +501,12 @@ def _allowed_digits(context, extra_values=()):
         pass
     for value in extra_values:
         try:
-            allowed.add(float(value))
+            number = float(value)
         except (TypeError, ValueError):
             continue
+        # 参数值也走同一条口径：非有限/超上界的值不进白名单。
+        if math.isfinite(number) and abs(number) <= NUM_ABS_LIMIT:
+            allowed.add(number)
     return allowed
 
 

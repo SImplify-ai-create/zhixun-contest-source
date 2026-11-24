@@ -11,6 +11,7 @@ P2 接 SDK 训练循环时，第一件事就是调 `run()`，把返回的 `candi
 同时落盘，作为本轮选择的审计记录。
 """
 
+import collections
 import json
 import math
 import os
@@ -107,10 +108,26 @@ def _log(msg):
     sys.stderr.flush()
 
 
+_JSONL_CACHE = collections.OrderedDict()
+_JSONL_CACHE_MAX = 4
+_MATRIX_CACHE = collections.OrderedDict()
+_MATRIX_CACHE_MAX = 4
+
+
 def load_jsonl(path):
-    """按文件顺序读 JSONL，返回 (行列表, 跳过行数)。坏行不猜，直接计数跳过。"""
+    """按文件顺序读 JSONL，返回 (行列表, 跳过行数)。坏行不猜，直接计数跳过。
+
+    C 线性能：同一轮里 train_stage.run / _slice_card / train_mlp 会各要一次
+    同一份 train/validation。这里按 (路径, mtime, size) 做进程内缓存，三处共用
+    同一份行对象；读数与坏行计数逐位不变。行对象只读，调用方不得原地改写。
+    """
     if not os.path.isfile(path):
         raise TrainStageError("找不到数据文件：%s" % path)
+    key = file_key(path)
+    hit = _JSONL_CACHE.get(key)
+    if hit is not None:
+        _JSONL_CACHE.move_to_end(key)
+        return hit
     rows, skipped = [], 0
     with open(path, "r", encoding="utf-8") as handle:
         for line in handle:
@@ -126,7 +143,11 @@ def load_jsonl(path):
                 skipped += 1
                 continue
             rows.append(obj)
-    return rows, skipped
+    out = (rows, skipped)
+    _JSONL_CACHE[key] = out
+    while len(_JSONL_CACHE) > _JSONL_CACHE_MAX:
+        _JSONL_CACHE.popitem(last=False)
+    return out
 
 
 def file_key(path):
@@ -252,7 +273,24 @@ def _matrix(rows, order):
     实现口径与旧版 `_flatten_inputs(...) == order` 完全等价：结构签名相同 ⟺
     路径列表相同。第一条命中行仍用慢路径对齐 `order`（只做一次），其后逐行比签名，
     省掉每行构造路径字符串的开销（C 线实测 11.5s → 1.7s）。
+
+    C 线性能：validation 矩阵在 train_stage.run 与 _slice_card 里各要一次；行对象
+    由 `load_jsonl` 缓存共享，这里按 (行对象身份, 特征序) 复用同一份矩阵。返回数组
+    只读，调用方不得原地改写。
     """
+    key = (id(rows), len(rows), len(order), tuple(order))
+    hit = _MATRIX_CACHE.get(key)
+    if hit is not None and hit["rows"] is rows:
+        _MATRIX_CACHE.move_to_end(key)
+        return hit["matrix"], hit["skipped"]
+    matrix, skipped = _matrix_uncached(rows, order)
+    _MATRIX_CACHE[key] = {"rows": rows, "matrix": matrix, "skipped": skipped}
+    while len(_MATRIX_CACHE) > _MATRIX_CACHE_MAX:
+        _MATRIX_CACHE.popitem(last=False)
+    return matrix, skipped
+
+
+def _matrix_uncached(rows, order):
     import numpy as np
 
     kept, skipped = [], 0

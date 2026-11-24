@@ -521,6 +521,21 @@ def _build_candidate(parent, chosen, cand_dir, params=None, data_dir=None,
     v2 格式（含 coef）才沿用"保留数组、只改写 action"的老路径。
     """
     target = os.path.join(cand_dir, CHECKPOINT_NAME)
+    if chosen == "C" and dataset_key == "C":
+        # C 线性能：同一轮里 C 臂在四臂评分与接管 prepare 中各拟合一次（父产物、
+        # 参数、轮次完全相同）。第二次直接复制第一次的字节相同产物，不再重复拟合。
+        memo_key = (parent.get("sha256"),
+                    json.dumps(params or {}, sort_keys=True), int(round_index))
+        hit = _C_BUILD_MEMO.get(memo_key)
+        if hit is not None:
+            os.makedirs(cand_dir, exist_ok=True)
+            for name in os.listdir(hit["dir"]):
+                source = os.path.join(hit["dir"], name)
+                if os.path.isfile(source):
+                    shutil.copyfile(source, os.path.join(cand_dir, name))
+            result = dict(hit["built"])
+            result["sha256"] = _sha256_file(target)
+            return result
     if chosen == PARENT:
         shutil.copyfile(parent["path"], target)
         # 本轮根本没训练：soup 不会尝试，必须把"为什么没进 soup"写进账本，
@@ -552,12 +567,14 @@ def _build_candidate(parent, chosen, cand_dir, params=None, data_dir=None,
                                         history_candidates=history)
         except train_mlp.TrainMlpError as exc:
             raise TrainRoundError("官方 MLP 续训失败：%s" % exc)
-        return {"weights_changed": report["weights_changed"], "action": None,
-                "params": {"lr": report["hyper"]["lr"],
-                           "batch": report["hyper"]["batch"],
-                           "epochs": report["hyper"]["epochs_run"],
-                           "scope": report["scope"]},
-                "sha256": _sha256_file(target), "training": report}
+        result = {"weights_changed": report["weights_changed"], "action": None,
+                  "params": {"lr": report["hyper"]["lr"],
+                             "batch": report["hyper"]["batch"],
+                             "epochs": report["hyper"]["epochs_run"],
+                             "scope": report["scope"]},
+                  "sha256": _sha256_file(target), "training": report}
+        _memo_c_build(chosen, dataset_key, parent, params, round_index, cand_dir, result)
+        return result
     if "coef" not in files:
         raise TrainRoundError("父检查点既不是官方格式，也没有 v2 的 coef；无法造动作候选")
 
@@ -568,8 +585,18 @@ def _build_candidate(parent, chosen, cand_dir, params=None, data_dir=None,
     arrays["action"] = np.array(action)
     arrays["action_params"] = np.array(json.dumps(params, sort_keys=True))
     np.savez(target, **arrays)
-    return {"weights_changed": False, "action": action, "params": params,
-            "sha256": _sha256_file(target)}
+    result = {"weights_changed": False, "action": action, "params": params,
+              "sha256": _sha256_file(target)}
+    _memo_c_build(chosen, dataset_key, parent, params, round_index, cand_dir, result)
+    return result
+
+
+def _memo_c_build(chosen, dataset_key, parent, params, round_index, cand_dir, result):
+    """C 线性能：记住本轮 C 臂第一次拟合的产物，供接管 prepare 复制复用。"""
+    if chosen == "C" and dataset_key == "C":
+        _C_BUILD_MEMO[(parent.get("sha256"),
+                       json.dumps(params or {}, sort_keys=True),
+                       int(round_index))] = {"dir": cand_dir, "built": dict(result)}
 
 
 def _weights_diff(parent_path, cand_path):
@@ -607,6 +634,7 @@ def _weights_diff(parent_path, cand_path):
 
 SIZE_CAP = 64 * 1024 * 1024  # 平台公告：产物总量 ≤64 MiB，不用 SDK 的 512 MiB
 CONFIG_BUDGET = 8 * 1024  # 账本 configuration 的内部预算：超了就按固定顺序删次要证据
+_C_BUILD_MEMO = {}
 
 
 def _candidate_cap(rnd):
@@ -679,6 +707,98 @@ def _shrink_config(cfg):
         _log("configuration 仍超过 8KiB：%d 字节（compacted=%s）"
              % (_config_size(cfg), ",".join(dropped) or "无"))
     return cfg
+
+
+# P0-1 升级（2026-11-24）：SDK 的 submit_candidate / finish 都会用
+# `json.dumps(configuration, allow_nan=False)` 生成声明，含 inf/nan 或不可 JSON 化的
+# 对象时直接抛 ValueError/TypeError，已提交成功的产物会被平台判失败。这里把
+# “整份 configuration 必须可序列化”变成提交前的硬自检，并给出降级路径。
+CONFIG_NUM_ABS_LIMIT = 1e12  # 与 llm_cage.NUM_ABS_LIMIT 同一条上界
+_DROP = object()  # _json_safe_copy 的“该字段已剔除”哨兵
+_BOOKKEEP_FAILED = object()  # 提交后簿记步骤失败的哨兵（与正常返回 None 区分）
+
+
+def _json_safe_copy(value, path="", dropped=None):
+    """返回一份一定能过 `json.dumps(..., allow_nan=False)` 的副本。
+
+    - 非有限 float（inf/nan）与 |x| > 1e12 的 float：剔除该字段并记路径；
+    - dict/list/tuple 递归；非字符串键、集合/bytes/自定义对象：剔除并记路径；
+    - 其余标量原样保留。合法输入的内容与序列化字节都不变。
+    """
+    if dropped is None:
+        dropped = []
+    if value is None or isinstance(value, (bool, str)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value) or abs(value) > CONFIG_NUM_ABS_LIMIT:
+            dropped.append(path or "<root>")
+            return _DROP
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                dropped.append("%s[非字符串键 %r]" % (path, key))
+                continue
+            child = _json_safe_copy(item, ("%s.%s" % (path, key)) if path else key, dropped)
+            if child is not _DROP:
+                out[key] = child
+        return out
+    if isinstance(value, (list, tuple)):
+        out = []
+        for index, item in enumerate(value):
+            child = _json_safe_copy(item, "%s[%d]" % (path, index), dropped)
+            if child is _DROP:
+                continue
+            out.append(child)
+        return out
+    dropped.append("%s(%s)" % (path or "<root>", type(value).__name__))
+    return _DROP
+
+
+def _config_selfcheck(cfg):
+    """整份 configuration 的 allow_nan=False 自检：通过返回 None，否则返回错误文本。"""
+    try:
+        json.dumps(cfg, ensure_ascii=False, sort_keys=True, allow_nan=False)
+    except (TypeError, ValueError, OverflowError) as exc:
+        return "%s: %s" % (type(exc).__name__, str(exc)[:200])
+    return None
+
+
+def _minimal_configuration(round_index, note="configuration_degraded"):
+    """降级用的最小合法配置：dict、短、全可序列化。"""
+    return {"degraded": str(note), "seed": int(round_index)}
+
+
+def _safe_configuration(cfg, round_index):
+    """提交/收尾前把 configuration 收成一定能过 allow_nan=False 的形态。
+
+    正常路径原样返回同一个对象：不改内容、不改字节，载荷与账本都不受影响。
+    自检失败时先剔除可疑字段（而不是整轮放弃），仍不过才降级为最小配置。
+    """
+    problem = _config_selfcheck(cfg)
+    if problem is None:
+        return cfg
+    dropped = []
+    safe = _json_safe_copy(cfg, "", dropped)
+    if safe is _DROP or not isinstance(safe, dict):
+        safe = _minimal_configuration(round_index, "configuration_not_a_dict")
+        dropped.append("<root>")
+    elif dropped:
+        safe["sanitized"] = list(dropped)[:8]
+    remaining = _config_selfcheck(safe)
+    if remaining is not None:
+        _log("configuration 剔除可疑字段后仍不可序列化（%s）：降级为最小配置" % remaining)
+        safe = _minimal_configuration(round_index, "configuration_not_serializable")
+        dropped.append("<root>")
+    if _config_size(safe) > CONFIG_BUDGET:
+        _shrink_config(safe)
+    _log("configuration 自检失败（%s）：已剔除 %d 个可疑字段（%s），按降级配置继续"
+         % (problem, len(dropped), ", ".join(dropped[:8]) or "无"))
+    return safe
+
 
 
 def _budget(cand_dir, cap=SIZE_CAP):
@@ -1743,6 +1863,48 @@ def _action_run(name, params, x):
     return np.vstack(rows)
 
 
+def _action_run_batch(x):
+    """C 线专用：一次行循环同时算出 5 个 EMA α 与 per_cond_seq 共 6 条路径。
+
+    逐元素算术与 `actions._step_ema` / `_step_per_cond`（cond=None）逐步相同：
+    第一行 EMA 输出全 0、状态 mean=x/var=0；per_cond_seq 走单组 Welford，
+    eps 取注册表默认 1e-8。返回顺序与 `_select_feature_action` 的候选顺序一致。
+    """
+    import numpy as np
+
+    alphas = [float(alpha) for alpha in ACTION_GRID]
+    k = len(alphas)
+    values = np.asarray(x, dtype=float)
+    n, dim = values.shape
+    eps = 1e-8  # actions.REGISTRY 里 streaming_ema_norm / per_cond_seq 的默认 eps
+    alpha = np.asarray(alphas, dtype=float).reshape(k, 1)
+    mean = np.zeros((k, dim))
+    var = np.zeros((k, dim))
+    ema_out = np.empty((k, n, dim))
+    cond_out = np.empty((n, dim))
+    cond_n = 0
+    cond_mean = np.zeros(dim)
+    cond_m2 = np.zeros(dim)
+    for index in range(n):
+        vector = values[index]
+        if index == 0:
+            ema_out[:, index, :] = 0.0
+            mean[:] = vector
+        else:
+            delta = vector - mean
+            mean = mean + alpha * delta
+            var = (1.0 - alpha) * (var + alpha * delta * delta)
+            sd = np.sqrt(np.maximum(var, 0.0))
+            ema_out[:, index, :] = (vector - mean) / np.where(sd > 0.0, sd, eps)
+        cond_n += 1
+        gap = vector - cond_mean
+        cond_mean = cond_mean + gap / cond_n
+        cond_m2 = cond_m2 + gap * (vector - cond_mean)
+        cond_sd = np.sqrt(np.maximum(cond_m2 / cond_n, 0.0))
+        cond_out[index] = vector / np.where(cond_sd > 0.0, cond_sd, eps)
+    return [ema_out[slot] for slot in range(k)] + [cond_out]
+
+
 def _select_feature_action(dataset_key, checkpoint_path, data_dir):
     """逐线实测：有利就开、不利就挡。返回可直接落进 metadata / 账本的决定。"""
     import numpy as np
@@ -1771,13 +1933,21 @@ def _select_feature_action(dataset_key, checkpoint_path, data_dir):
     any_improved = False
     candidates = [("streaming_ema_norm", {"alpha": alpha}) for alpha in ACTION_GRID]
     candidates.append(("per_cond_seq", {}))
-    for name, params in candidates:
+    if dataset_key == "C":
+        # C 线性能：6 条 causal 路径共用一次行循环；逐元素算术与 actions 的步进相同。
+        measured = list(zip(candidates, _action_run_batch(x)))
+    else:
+        measured = []
+        for name, params in candidates:
+            try:
+                measured.append(((name, params), _action_run(name, params, x)))
+            except actions.ActionError as exc:
+                measured.append(((name, params), exc))
+    for (name, params), z_values in measured:
         label = name if name == "per_cond_seq" else "ema%.4g" % params["alpha"]
-        try:
-            z_values = _action_run(name, params, x)
-        except actions.ActionError as exc:
+        if isinstance(z_values, actions.ActionError):
             scores[label] = None
-            _log("动作 %s 不可用（%s），跳过" % (name, exc))
+            _log("动作 %s 不可用（%s），跳过" % (name, z_values))
             continue
         value = score(z_values)
         scores[label] = value
@@ -2758,6 +2928,9 @@ def run(rnd, data_dir=None, work_dir=None, pessimism_k=None):
         return hyp, summary, cfg
 
     hypothesis, change, configuration = make_configuration(chosen, prepared, policy)
+    # P0-1 升级：submit 之前对整份 configuration 做 allow_nan=False 自检；
+    # 过不了就剔除可疑字段（不整轮放弃），保证交给 SDK 的一定是可序列化的 dict。
+    configuration = _safe_configuration(configuration, round_index)
     artifact_id = None
     submitted = None
     failed_arm = None
@@ -2807,6 +2980,7 @@ def run(rnd, data_dir=None, work_dir=None, pessimism_k=None):
         chosen = PARENT
         _stamp_feature_action(getattr(rnd, "dataset_key", None), prepared, data)
         hypothesis, change, configuration = make_configuration(PARENT, prepared, policy)
+        configuration = _safe_configuration(configuration, round_index)
         try:
             submitted = _submit(_payload(prepared))
         except BaseException as exc2:
@@ -2814,89 +2988,168 @@ def run(rnd, data_dir=None, work_dir=None, pessimism_k=None):
                 _raise_interruption(exc2)
             raise
     artifact_id = submitted.get("artifact_id") if isinstance(submitted, dict) else None
-    if fact_probe is not None:
-        fact_probe.train_receipt("submit", submitted)
     if not artifact_id:
         raise TrainRoundError("submit_candidate 未返回 artifact_id")
 
-    score = _arm_score(submitted)
-    parent_mean = (arms_in.get(PARENT) or {}).get("mean")
-    delta = None
-    if score is not None and parent_mean is not None and chosen != PARENT:
-        delta = float(score["value"]) - float(parent_mean)
-    guarded, warning = llm_cage.guard_hypothesis(model_note, delta)
-    # 只改本地账本里的叙事字段；平台已收到的 configuration 保持提交时的原样。
-    configuration["model"]["hypothesis_guarded"] = guarded
-    configuration["model"]["delta_vs_parent"] = delta
-    configuration["model"]["guard_warning"] = warning
-    # 这三个是提交后补的本地叙事字段：平台副本已在提交时定格，但本地账本
-    # 会因此多出十几字节，可能重新越过 8 KiB。再压一次，保证账本也守预算。
-    if _config_size(configuration) > CONFIG_BUDGET:
-        _shrink_config(configuration)
-    if warning:
-        _log("叙事校验：%s" % warning)
-
-    arms = _next_arms(arms_in, chosen, score, failed_arm)
-    reason = _reason_text(round_index, chosen, submitted)
-
-    # ---- 历史最优（v4，2026-11-21）：本地 state 副本，不再向平台读回产物 ----
-    # 副本在上面的 _apply_local_best 里已经比过并把更优者做成了本轮上传载荷，
-    # 因此 finish 只选本轮提交的产物：它本身就是"至今最优"，最后一轮交的即历史最优。
+    # ---- P0-2（2026-11-24）：submit 成功之后全是簿记。任何一步异常都只记 stderr，
+    # 绝不允许冒泡成"train(rnd) 返回时没有 finish"——harness.py:457 会因此判
+    # round_failed，把已提交成功的合法产物白白作废。finish 在最后无条件发一次，
+    # selected_artifact_id 永远是上面已拿到的 artifact_id。
     finish_id = artifact_id
-    _log("第%s轮最优：副本第%s轮 → 本轮上传第%s轮（替换=%s）"
-         % (round_index, (best_record or {}).get("best_round"),
-            (best_record or {}).get("source_round"),
-            (best_record or {}).get("replaced")))
-
+    ledger_path = os.path.join(work, "round-%s" % round_index, LEDGER_FILE)
     ledger = {
         "hypothesis": hypothesis,
         "change_summary": change,
         "configuration": configuration,
-        "reason": reason,
+        "reason": "",
+        "artifact_id": artifact_id,
+        "finish_artifact_id": finish_id,
     }
-    state = _state_record(state_path, ledger, round_index, finish_id,
-                          previous_state, arms, score, signature=signature,
-                          failed_combo=failed_combo, best=best_state,
-                          bias_ema=bias_ema,
-                          bias_last=bias_family.compact(bias_record))
-    _rpc_guard("save_state", rnd.save_state, state_path)
+    bookkeeping_errors = []
 
-    ledger["state"] = state
-    ledger["artifact_id"] = artifact_id
-    ledger["finish_artifact_id"] = finish_id
+    def _bookkeep(label, call, *args, **kwargs):
+        """跑一步簿记；失败只落 stderr 与 bookkeeping_errors，永不冒泡。"""
+        try:
+            return call(*args, **kwargs)
+        except BaseException as exc:  # noqa: BLE001 - 簿记失败不许冒泡到 finish
+            detail = "%s: %s" % (type(exc).__name__, str(exc)[:200])
+            bookkeeping_errors.append("%s: %s" % (label, detail))
+            _log("提交成功后的簿记步骤 %s 失败（artifact=%s，已忽略，不影响 finish）：%s"
+                 % (label, artifact_id, detail))
+            return _BOOKKEEP_FAILED
+
+    def _model_call_ids():
+        """finish 必须带非空 call_id 列表；对畸形的 calls 元素也做防御。"""
+        ids = []
+        for item in calls or []:
+            call_id = item.get("call_id") if isinstance(item, dict) else None
+            if call_id:
+                ids.append(call_id)
+        if not ids:
+            ids = [str(item) for item in (getattr(rnd, "call_ids", None) or []) if item]
+        return ids
+
+    def _history_ids():
+        return [str(item) for item in (history_ids or [])]
+
+    if fact_probe is not None:
+        _bookkeep("fact_probe.train_receipt", fact_probe.train_receipt,
+                  "submit", submitted)
+
+    # ---- 回执打分（只读平台返回的数字） ----
+    score = _bookkeep("arm_score", _arm_score, submitted)
+    if score is _BOOKKEEP_FAILED or not isinstance(score, dict):
+        score = None
+
+    # ---- 提交后的叙事收尾：老代码里紧跟在 submit 后的配置收尾窗口 ----
+    def _guard_narrative():
+        parent_mean = (arms_in.get(PARENT) or {}).get("mean")
+        delta = None
+        if score is not None and parent_mean is not None and chosen != PARENT:
+            delta = float(score["value"]) - float(parent_mean)
+        guarded, warning = llm_cage.guard_hypothesis(model_note, delta)
+        # 只改本地账本里的叙事字段；平台已收到的 configuration 保持提交时的原样。
+        configuration["model"]["hypothesis_guarded"] = guarded
+        configuration["model"]["delta_vs_parent"] = delta
+        configuration["model"]["guard_warning"] = warning
+        # 这三个是提交后补的本地叙事字段：平台副本已在提交时定格，但本地账本
+        # 会因此多出十几字节，可能重新越过 8 KiB。再压一次，保证账本也守预算。
+        if _config_size(configuration) > CONFIG_BUDGET:
+            _shrink_config(configuration)
+        if warning:
+            _log("叙事校验：%s" % warning)
+
+    _bookkeep("guard_hypothesis", _guard_narrative)
+
+    arms = _bookkeep("next_arms", _next_arms, arms_in, chosen, score, failed_arm)
+    if arms is _BOOKKEEP_FAILED or not isinstance(arms, dict):
+        arms = dict(arms_in)
+    reason = _bookkeep("reason", _reason_text, round_index, chosen, submitted)
+    if reason is _BOOKKEEP_FAILED:
+        reason = ""
+
+    # ---- 历史最优（v4，2026-11-21）：本地 state 副本，不再向平台读回产物 ----
+    # 副本在上面的 _apply_local_best 里已经比过并把更优者做成了本轮上传载荷，
+    # 因此 finish 只选本轮提交的产物：它本身就是"至今最优"，最后一轮交的即历史最优。
+    def _log_best():
+        _log("第%s轮最优：副本第%s轮 → 本轮上传第%s轮（替换=%s）"
+             % (round_index, (best_record or {}).get("best_round"),
+                (best_record or {}).get("source_round"),
+                (best_record or {}).get("replaced")))
+
+    _bookkeep("best_log", _log_best)
+
+    # ---- state：_state_record 先落 state 文件，随后调用平台 save_state ----
+    def _build_state():
+        return _state_record(state_path, ledger, round_index, finish_id,
+                             previous_state, arms, score, signature=signature,
+                             failed_combo=failed_combo, best=best_state,
+                             bias_ema=bias_ema,
+                             bias_last=bias_family.compact(bias_record))
+
+    state = _bookkeep("state_record", _build_state)
+    if state is not _BOOKKEEP_FAILED and isinstance(state, dict):
+        _bookkeep("save_state", _rpc_guard, "save_state", rnd.save_state, state_path)
+        ledger["state"] = state
+
     ledger["best"] = best_record
     # 载荷事实：本轮真正上传的那份（payload_dir 优先）的 sha 与 metadata.calibration，
     # 让"校准是否进产物"能在账本里直接对账，不必回读工作目录。
-    payload_path = os.path.join(_payload(prepared), CHECKPOINT_NAME)
-    try:
-        payload_meta = train_mlp._load_parent(payload_path)["meta"]
-    except Exception:  # noqa: BLE001 - 读不出就留空，不影响本轮提交
-        payload_meta = {}
-    ledger["payload"] = {
-        "path": payload_path,
-        "sha256": (_sha256_file(payload_path) if os.path.isfile(payload_path) else None),
-        "calibration": payload_meta.get("calibration"),
-    }
-    ledger_path = os.path.join(work, "round-%s" % round_index, LEDGER_FILE)
-    _dump_json(ledger_path, ledger)
+    def _payload_fact():
+        payload_path = os.path.join(_payload(prepared), CHECKPOINT_NAME)
+        try:
+            payload_meta = train_mlp._load_parent(payload_path)["meta"]
+        except Exception:  # noqa: BLE001 - 读不出就留空，不影响本轮提交
+            payload_meta = {}
+        return {
+            "path": payload_path,
+            "sha256": (_sha256_file(payload_path) if os.path.isfile(payload_path) else None),
+            "calibration": payload_meta.get("calibration"),
+        }
 
-    if fact_probe is not None:
+    payload_fact = _bookkeep("payload_fact", _payload_fact)
+    if payload_fact is not _BOOKKEEP_FAILED:
+        ledger["payload"] = payload_fact
+    if bookkeeping_errors:
+        ledger["bookkeeping_errors"] = list(bookkeeping_errors)
+    ledger["reason"] = reason
+    _bookkeep("ledger_dump", _dump_json, ledger_path, ledger)
+    # 落盘这一步自身失败时，文件里记不到它；返回的账本补上，便于外部对账。
+    if bookkeeping_errors:
+        ledger["bookkeeping_errors"] = list(bookkeeping_errors)
+
+    def _probe_finish():
         fact_probe.train_finish(
             round_index=round_index,
             chosen=chosen,
             artifact_id=artifact_id,
             policy=policy,
-            history_ids=list(history_ids),
-            model_call_ids=[item["call_id"] for item in calls if item["call_id"]],
+            history_ids=_history_ids(),
+            model_call_ids=_model_call_ids(),
             score=score,
         )
+
+    if fact_probe is not None:
+        _bookkeep("fact_probe.train_finish", _probe_finish)
+
+    # ---- 无条件收尾：无论上面失败与否，都用已提交的 artifact_id 发最小合法 finish ----
+    # finish 的 configuration 再过一次 P0-1 自检；过不了就换最小配置，artifact_id 不变。
+    finish_configuration = _bookkeep(
+        "safe_configuration", _safe_configuration, configuration, round_index)
+    if finish_configuration is _BOOKKEEP_FAILED or not isinstance(finish_configuration, dict):
+        finish_configuration = _minimal_configuration(round_index,
+                                                      "finish_configuration_degraded")
+    if not isinstance(reason, str) or not reason.strip():
+        reason = "第%s轮已提交 artifact_id=%s；簿记降级收尾" % (round_index, artifact_id)
     _rpc_guard("finish", rnd.finish, selected_artifact_id=finish_id,
                hypothesis=hypothesis,
                change_summary=change,
                reason=reason,
-               configuration=configuration,
+               configuration=finish_configuration,
                seed=round_index,
-               history_ids=history_ids,
-               model_call_ids=[item["call_id"] for item in calls if item["call_id"]])
-    _log("第%s轮完成：候选 %s，artifact=%s" % (round_index, chosen, artifact_id))
+               history_ids=_history_ids(),
+               model_call_ids=_model_call_ids())
+    _log("第%s轮完成：候选 %s，artifact=%s%s"
+         % (round_index, chosen, artifact_id,
+            ("（簿记降级 %d 处）" % len(bookkeeping_errors)) if bookkeeping_errors else ""))
     return ledger

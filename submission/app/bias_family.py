@@ -454,6 +454,14 @@ def apply(dataset_key, data_dir, parent_path, prepared, work_dir, round_index,
     # ---- 候选生成 → 性质测试 → 逐个测量 ----
     import numpy as np
 
+    # C 线性能：仿射候选中 trial_b2 恒等于 b2，前向只算一次；每个候选只做
+    # a·value+c 与指标。数值顺序与 `_predict_calibrated` 完全一致。
+    base_value = None
+    if key == "C":
+        _hidden, _out = train_mlp._forward(
+            z_val, arrays["w1"], arrays["b1"], arrays["w2"], arrays["b2"])
+        base_value = _out[:, 0] * target_scale + target_mean
+
     scratch = os.path.join(work_dir, "round-%s" % round_index, "bias")
     if os.path.isdir(scratch):
         shutil.rmtree(scratch)
@@ -490,8 +498,14 @@ def apply(dataset_key, data_dir, parent_path, prepared, work_dir, round_index,
             entry["class"] = nonzero[0] if nonzero else None
             entry["value"] = float(cand["delta"][nonzero[0]]) if nonzero else 0.0
         if check["ok"]:
-            metrics = _measure(z_val, y_val, ref["task"], arrays, trial_b2,
-                               target_mean, target_scale, calibration)
+            if base_value is not None:
+                pred = np.maximum(0.0, float(cand["a"]) * base_value + float(cand["c"]))
+                rmse = float(math.sqrt(float(((pred - y_val) ** 2).mean())))
+                metrics = {"score": -rmse, "rmse": rmse,
+                           "nas": train_mlp.nasa_score(y_val, pred)}
+            else:
+                metrics = _measure(z_val, y_val, ref["task"], arrays, trial_b2,
+                                   target_mean, target_scale, calibration)
             entry.update({name: (_round(value) if isinstance(value, float) else value)
                           for name, value in metrics.items()})
             ok_items.append({"entry": entry, "cand": cand, "metrics": metrics})
